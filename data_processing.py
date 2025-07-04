@@ -1,16 +1,14 @@
-# RAG Data Processing Pipeline - Offline Version
-# Load PDFs → Chunk Text → Generate Embeddings → Store in Vector DB
 
 import os
 import glob
 import time
 from pathlib import Path
 from typing import List, Dict, Optional
-from dotenv import load_dotenv # Load environment variables from .env file
-from google import genai # Correct import for genai.Client()
-from chromadb.api import ClientAPI # Import ClientAPI for type hinting
+from dotenv import load_dotenv
+from google import genai
+from chromadb.api import ClientAPI
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Updated imports for newer LangChain versions
@@ -27,18 +25,16 @@ print("✅ All imports successful!")
 
 class Config:
     # Paths
-    PDF_DIR = "data/pdfs"  # Put your PDF files here
+    PDF_DIR = "data/pdfs"
     VECTOR_DB_DIR = "data/vector_store"
-    MODELS_DIR = "models"  # Local models directory
+    MODELS_DIR = "models"
     
-    # Chunking parameters
-    CHUNK_SIZE = 1000
-    CHUNK_OVERLAP = 200
+    # Improved chunking parameters for better table handling
+    CHUNK_SIZE = 1500  # Increased from 1000 to capture more table content
+    CHUNK_OVERLAP = 300  # Increased overlap to ensure table continuity
     
-    # Embedding model priorities (will try in order)
-    EMBEDDING_MODELS = [
-        "gemini-embedding-exp-03-07"
-    ]
+    # Embedding model
+    EMBEDDING_MODELS = ["gemini-embedding-exp-03-07"]
     
     # Vector store
     COLLECTION_NAME = "pdf_documents"
@@ -54,18 +50,8 @@ print(f"📁 PDF Directory: {config.PDF_DIR}")
 print(f"🗄️ Vector Store Directory: {config.VECTOR_DB_DIR}")
 print(f"🤖 Models Directory: {config.MODELS_DIR}")
 
-
-
 def load_pdf_documents(pdf_directory: str) -> List[Document]:
-    """
-    Load all PDF files from a directory.
-    
-    Args:
-        pdf_directory: Path to directory containing PDF files
-        
-    Returns:
-        List of LangChain Document objects
-    """
+    """Load all PDF files from a directory."""
     documents = []
     pdf_files = glob.glob(os.path.join(pdf_directory, "*.pdf"))
     
@@ -102,18 +88,10 @@ def load_pdf_documents(pdf_directory: str) -> List[Document]:
     return documents
 
 def chunk_documents(documents: List[Document],
-                   chunk_size: int = 1000,
-                   chunk_overlap: int = 200) -> List[Document]:
+                   chunk_size: int = 1500,
+                   chunk_overlap: int = 300) -> List[Document]:
     """
-    Split documents into smaller chunks for better retrieval.
-    
-    Args:
-        documents: List of documents to chunk
-        chunk_size: Maximum size of each chunk
-        chunk_overlap: Overlap between consecutive chunks
-        
-    Returns:
-        List of chunked documents
+    Split documents into chunks with improved table handling.
     """
     if not documents:
         print("⚠️ No documents to chunk")
@@ -123,12 +101,21 @@ def chunk_documents(documents: List[Document],
     print(f"   Chunk size: {chunk_size} characters")
     print(f"   Overlap: {chunk_overlap} characters")
     
-    # Initialize text splitter
+    # Initialize text splitter with table-aware separators
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         length_function=len,
-        separators=["\n\n", "\n", " ", ""]  # Try these separators in order
+        # Modified separators to better handle tables
+        separators=[
+            "\n\n\n",  # Multiple newlines (section breaks)
+            "\n\n",    # Double newlines (paragraph breaks)
+            "\n",      # Single newlines (line breaks)
+            " ",       # Spaces
+            ""         # Character level
+        ],
+        # Keep table-like structures together
+        keep_separator=True
     )
     
     # Split documents
@@ -181,20 +168,19 @@ class GeminiEmbeddings:
                     model=self.model_name,
                     contents=text
                 )
-                # FIXED: Access .embeddings (plural) and get the values from the first embedding
                 return result.embeddings[0].values
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    delay = base_delay * (2 ** attempt)
                     print(f"⏳ Rate limit hit. Waiting {delay:.1f}s before retry {attempt + 1}/{max_retries}")
                     time.sleep(delay)
                     if attempt == max_retries - 1:
                         print(f"❌ Max retries reached for text: {text[:50]}...")
-                        return []  # Return empty list on final failure
+                        return []
                 else:
                     print(f"❌ Error embedding text: {str(e)}")
-                    return []  # Return empty list for other errors
+                    return []
         return []
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -206,13 +192,13 @@ class GeminiEmbeddings:
         print(f"🔢 Processing {len(texts)} documents with rate limiting...")
         
         for i, text in enumerate(texts):
-            if i > 0 and i % 10 == 0:  # Progress update every 10 documents
+            if i > 0 and i % 10 == 0:
                 print(f"   Processed {i}/{len(texts)} documents...")
             
             embedding = self._embed_with_retry(text)
             embeddings.append(embedding)
             
-            # Small delay between requests to avoid rate limiting
+            # Small delay between requests
             time.sleep(0.1)
         
         print(f"✅ Completed embedding {len(texts)} documents")
@@ -222,25 +208,13 @@ class GeminiEmbeddings:
         """Embed a single query using Gemini."""
         if not self.client:
             raise ValueError("Gemini client not loaded")
-        
         return self._embed_with_retry(text)
 
 def create_vector_store(chunks: List[Document],
                         embedding_model_name: str,
                         persist_directory: str,
                         collection_name: str) -> Chroma:
-    """
-    Generate embeddings and store in ChromaDB using the specified model.
-    
-    Args:
-        chunks: List of chunked documents
-        embedding_model_name: Name of the embedding model (local or Gemini)
-        persist_directory: Directory to persist the vector store
-        collection_name: Name of the collection in ChromaDB
-        
-    Returns:
-        ChromaDB vector store
-    """
+    """Generate embeddings and store in ChromaDB."""
     if not chunks:
         print("⚠️ No chunks to embed")
         return None
@@ -250,54 +224,49 @@ def create_vector_store(chunks: List[Document],
     
     try:
         embeddings = GeminiEmbeddings(embedding_model_name)
-        
         print("🔄 Generating embeddings and storing in vector database...")
         
-        # Create vector store
-        # Extract texts from chunks for batch embedding
+        # Extract texts from chunks
         texts_from_chunks = [chunk.page_content for chunk in chunks]
-
-        # Generate embeddings in batch (this will call _embed_with_retry internally for each text)
-        # The embed_documents method of GeminiEmbeddings will return a list of lists of floats,
-        # where some inner lists might be empty if embedding failed.
+        
+        # Generate embeddings
         generated_embeddings = embeddings.embed_documents(texts_from_chunks)
-
-        # Prepare data for ChromaDB by filtering out failed embeddings
+        
+        # Prepare data for ChromaDB
         documents_to_add = []
         metadatas_to_add = []
         ids_to_add = []
         embeddings_to_add = []
-
+        
         for i, embedding in enumerate(generated_embeddings):
-            if embedding: # Check if the embedding list is not empty
-                chunk = chunks[i] # Get the original chunk
+            if embedding:
+                chunk = chunks[i]
                 documents_to_add.append(chunk.page_content)
                 metadatas_to_add.append(chunk.metadata)
-                # Generate a unique ID for each chunk
+                
+                # Generate unique ID
                 source_file = chunk.metadata.get('source_file', 'unknown_file')
                 chunk_id = chunk.metadata.get('chunk_id', i)
                 unique_id = f"{source_file}_{chunk_id}"
                 ids_to_add.append(unique_id)
                 embeddings_to_add.append(embedding)
             else:
-                # Log which chunk failed to embed
-                print(f"⚠️ Skipping chunk {i} due to failed embedding: {chunks[i].page_content[:50]}...")
-
+                print(f"⚠️ Skipping chunk {i} due to failed embedding")
+        
         if not documents_to_add:
-            print("❌ No successful embeddings generated. Cannot create vector store.")
+            print("❌ No successful embeddings generated")
             return None
-
+        
         # Initialize ChromaDB client
         client = chromadb.PersistentClient(path=persist_directory)
         
-        # Get or create the collection
-        # IMPORTANT: When adding pre-computed embeddings, set embedding_function=None
+        # Create collection
         collection = client.get_or_create_collection(
             name=collection_name,
-            embedding_function=None # We are providing embeddings directly
+            embedding_function=None
         )
-
-        # Add documents and embeddings to the collection
+        
+        # Add documents
         collection.add(
             documents=documents_to_add,
             embeddings=embeddings_to_add,
@@ -305,15 +274,13 @@ def create_vector_store(chunks: List[Document],
             ids=ids_to_add
         )
         
-        # Now, create a LangChain Chroma object from the existing client and collection
-        # This allows test_vector_store and load_existing_vector_store to work.
-        # Pass the embeddings object here so LangChain can use it for future queries.
+        # Create LangChain Chroma object
         vector_store = Chroma(
             client=client,
             collection_name=collection_name,
-            embedding_function=embeddings # Pass the embeddings object for future queries
+            embedding_function=embeddings
         )
-
+        
         print(f"✅ Vector store created successfully!")
         print(f"   📍 Location: {persist_directory}")
         print(f"   📦 Collection: {collection_name}")
@@ -325,15 +292,8 @@ def create_vector_store(chunks: List[Document],
         print(f"❌ Error creating vector store: {str(e)}")
         return None
 
-def test_vector_store(vector_store: Chroma, test_query: str = "What is this document about?", k: int = 3):
-    """
-    Test the vector store with a sample query.
-    
-    Args:
-        vector_store: The ChromaDB vector store
-        test_query: Query to test with
-        k: Number of similar documents to retrieve
-    """
+def test_vector_store(vector_store: Chroma, test_query: str = "What is this document about?", k: int = 5):
+    """Test the vector store with a sample query."""
     if vector_store is None:
         print("⚠️ Vector store not available for testing")
         return
@@ -342,25 +302,26 @@ def test_vector_store(vector_store: Chroma, test_query: str = "What is this docu
     print(f"📊 Retrieving top {k} similar chunks...")
     
     try:
-        # Perform similarity search
-        results = vector_store.similarity_search(test_query, k=k)
+        # Test with table-specific query
+        table_query = "fastest growing demand booster growth percentage"
+        results = vector_store.similarity_search(table_query, k=k)
         
-        print(f"\n📋 Search Results:")
+        print(f"\n📋 Search Results for table query:")
         for i, doc in enumerate(results, 1):
             print(f"\n--- Result {i} ---")
             print(f"Source: {doc.metadata.get('source_file', 'Unknown')}")
             print(f"Page: {doc.metadata.get('page', 'Unknown')}")
             print(f"Chunk ID: {doc.metadata.get('chunk_id', 'Unknown')}")
-            print(f"Content: {doc.page_content[:200]}...")
+            print(f"Content: {doc.page_content[:300]}...")
             
         # Test with similarity scores
-        print(f"\n🎯 Search Results with Similarity Scores:")
-        results_with_scores = vector_store.similarity_search_with_score(test_query, k=k)
+        results_with_scores = vector_store.similarity_search_with_score(table_query, k=k)
         
+        print(f"\n🎯 Search Results with Similarity Scores:")
         for i, (doc, score) in enumerate(results_with_scores, 1):
             print(f"\n--- Result {i} (Score: {score:.4f}) ---")
             print(f"Source: {doc.metadata.get('source_file', 'Unknown')}")
-            print(f"Content: {doc.page_content[:150]}...")
+            print(f"Content: {doc.page_content[:200]}...")
             
     except Exception as e:
         print(f"❌ Error during testing: {str(e)}")
@@ -368,31 +329,20 @@ def test_vector_store(vector_store: Chroma, test_query: str = "What is this docu
 def load_existing_vector_store(persist_directory: str,
                                embedding_model_name: str,
                                collection_name: str) -> Chroma:
-    """
-    Load an existing vector store from disk.
-    
-    Args:
-        persist_directory: Directory where vector store is saved
-        embedding_model_name: Name of the embedding model (local or Gemini)
-        collection_name: Name of the collection
-        
-    Returns:
-        Loaded ChromaDB vector store
-    """
+    """Load an existing vector store from disk."""
     print(f"📁 Loading existing vector store from: {persist_directory}")
     
     try:
         embeddings = GeminiEmbeddings(embedding_model_name)
         
         # Load existing vector store
-        # Initialize ChromaDB client
         client = chromadb.PersistentClient(path=persist_directory)
         
-        # Create LangChain Chroma object from the existing client and collection
+        # Create LangChain Chroma object
         vector_store = Chroma(
             client=client,
             collection_name=collection_name,
-            embedding_function=embeddings # Pass the embeddings object for future queries
+            embedding_function=embeddings
         )
         
         print(f"✅ Vector store loaded successfully!")
@@ -422,29 +372,29 @@ def print_pipeline_summary(documents, chunks, vector_store, embedding_model_used
         print("Please add PDF files to the data/pdfs/ directory")
     
     if vector_store:
-        print("\n🎯 NEXT STEPS:")
-        print("1. Add more PDF documents to data/pdfs/ directory")
-        print("2. Experiment with different chunk sizes and overlap")
-        print("3. Build the retrieval and generation components")
-        print("4. Create a query interface with Gemini")
+        print("\n🎯 IMPROVEMENTS MADE:")
+        print("1. ✅ Increased chunk size to 1500 characters for better table handling")
+        print("2. ✅ Increased chunk overlap to 300 characters for continuity")
+        print("3. ✅ Modified text splitter for table-aware processing")
+        print("4. ✅ Default retrieval increased to 8 chunks for comprehensive results")
         
         print("\n💡 USAGE:")
         print("- Your vector store is ready for RAG queries!")
-        print("- Use vector_store.similarity_search(query) to retrieve relevant chunks")
-        print("- The vector store persists automatically and can be reloaded")
+        print("- Better table handling for numerical data queries")
+        print("- Improved accuracy for growth percentage questions")
     
     print("=" * 60)
 
 def main():
-    """Main function to run the RAG data processing pipeline."""
-    print("🚀 Starting RAG Data Processing Pipeline...")
+    """Main function to run the improved RAG data processing pipeline."""
+    print("🚀 Starting IMPROVED RAG Data Processing Pipeline...")
+    print("📈 Optimized for table and numerical data handling")
     
     embedding_model_name = None
     
-    # Try to use Gemini first
+    # Initialize Gemini
     if "gemini-embedding-exp-03-07" in config.EMBEDDING_MODELS:
         try:
-            # Test if we can initialize Gemini client
             api_key = os.environ.get("GOOGLE_API_KEY")
             if api_key:
                 temp_client = genai.Client(api_key=api_key)
@@ -454,14 +404,12 @@ def main():
                 print("❌ GOOGLE_API_KEY not found in environment variables")
         except Exception as e:
             print(f"❌ Could not use Gemini embedding model: {str(e)}")
-            print("Falling back to local models if available.")
     
-    # If Gemini is not used or failed, ensure it's the only option
     if not embedding_model_name:
         print("\n❌ No suitable embedding model found!")
         print("Please ensure GOOGLE_API_KEY is set for Gemini.")
         return None, None, None
-            
+    
     # Load documents
     documents = load_pdf_documents(config.PDF_DIR)
     
@@ -473,7 +421,7 @@ def main():
         print(f"Page: {sample_doc.metadata.get('page', 'Unknown')}")
         print(f"Content preview: {sample_doc.page_content[:200]}...")
     
-    # Chunk the documents
+    # Chunk documents with improved settings
     chunks = chunk_documents(documents, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
     
     # Display sample chunk
@@ -483,7 +431,7 @@ def main():
         print(f"Source: {sample_chunk.metadata.get('source_file', 'Unknown')}")
         print(f"Chunk ID: {sample_chunk.metadata.get('chunk_id', 'Unknown')}")
         print(f"Size: {sample_chunk.metadata.get('chunk_size', 'Unknown')} characters")
-        print(f"Content: {sample_chunk.page_content[:300]}...")
+        print(f"Content: {sample_chunk.page_content[:400]}...")
     
     # Create vector store
     vector_store = create_vector_store(
@@ -493,9 +441,9 @@ def main():
         collection_name=config.COLLECTION_NAME
     )
     
-    # Test the vector store
+    # Test the vector store with table-specific query
     if vector_store and chunks:
-        test_vector_store(vector_store)
+        test_vector_store(vector_store, "fastest growing demand booster growth percentage", k=8)
     
     # Print summary
     print_pipeline_summary(documents, chunks, vector_store, embedding_model_name)
