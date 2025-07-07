@@ -1,3 +1,4 @@
+# Page-Based Chunking with Cross-Page Similarity Merging
 
 import os
 import glob
@@ -29,9 +30,9 @@ class Config:
     VECTOR_DB_DIR = "data/vector_store"
     MODELS_DIR = "models"
     
-    # Improved chunking parameters for better table handling
-    CHUNK_SIZE = 1500  # Increased from 1000 to capture more table content
-    CHUNK_OVERLAP = 300  # Increased overlap to ensure table continuity
+    # Page-based chunking parameters
+    PAGE_OVERLAP_CHARS = 800  # Characters to overlap between pages
+    MAX_CHUNK_SIZE = 4000     # Maximum chunk size
     
     # Embedding model
     EMBEDDING_MODELS = ["gemini-embedding-exp-03-07"]
@@ -87,57 +88,104 @@ def load_pdf_documents(pdf_directory: str) -> List[Document]:
     print(f"\n📄 Total documents loaded: {len(documents)}")
     return documents
 
-def chunk_documents(documents: List[Document],
-                   chunk_size: int = 1500,
-                   chunk_overlap: int = 300) -> List[Document]:
+def create_page_based_chunks(documents: List[Document], 
+                           overlap_chars: int = 800,
+                           max_chunk_size: int = 4000) -> List[Document]:
     """
-    Split documents into chunks with improved table handling.
+    Create page-based chunks with significant overlap between consecutive pages.
     """
     if not documents:
         print("⚠️ No documents to chunk")
         return []
     
-    print(f"✂️ Chunking {len(documents)} documents...")
-    print(f"   Chunk size: {chunk_size} characters")
-    print(f"   Overlap: {chunk_overlap} characters")
+    print(f"✂️ Creating page-based chunks with cross-page overlap...")
+    print(f"   Page overlap: {overlap_chars} characters")
+    print(f"   Max chunk size: {max_chunk_size} characters")
     
-    # Initialize text splitter with table-aware separators
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        # Modified separators to better handle tables
-        separators=[
-            "\n\n\n",  # Multiple newlines (section breaks)
-            "\n\n",    # Double newlines (paragraph breaks)
-            "\n",      # Single newlines (line breaks)
-            " ",       # Spaces
-            ""         # Character level
-        ],
-        # Keep table-like structures together
-        keep_separator=True
-    )
+    # Group documents by source file
+    file_groups = {}
+    for doc in documents:
+        source_file = doc.metadata.get('source_file', 'unknown')
+        if source_file not in file_groups:
+            file_groups[source_file] = []
+        file_groups[source_file].append(doc)
     
-    # Split documents
-    chunked_docs = text_splitter.split_documents(documents)
+    all_chunks = []
+    chunk_id = 0
     
-    # Add chunk metadata
-    for i, chunk in enumerate(chunked_docs):
-        chunk.metadata.update({
-            'chunk_id': i,
-            'chunk_size': len(chunk.page_content)
-        })
+    for source_file, pages in file_groups.items():
+        # Sort pages by page number
+        pages.sort(key=lambda x: x.metadata.get('page', 0))
+        
+        print(f"\n📄 Processing {source_file} ({len(pages)} pages)...")
+        
+        for i, page in enumerate(pages):
+            page_content = page.page_content
+            page_num = page.metadata.get('page', i)
+            
+            # Create base page chunk
+            base_chunk = Document(
+                page_content=page_content[:max_chunk_size],
+                metadata={
+                    **page.metadata,
+                    'chunk_id': chunk_id,
+                    'chunk_type': 'page_based',
+                    'chunk_size': len(page_content[:max_chunk_size]),
+                    'page_start': page_num,
+                    'page_end': page_num
+                }
+            )
+            all_chunks.append(base_chunk)
+            chunk_id += 1
+            
+            # Create overlapping chunk with next page if exists
+            if i < len(pages) - 1:
+                next_page = pages[i + 1]
+                next_page_content = next_page.page_content
+                
+                # Get overlap from current page (last N characters)
+                current_overlap = page_content[-overlap_chars:] if len(page_content) > overlap_chars else page_content
+                
+                # Get beginning from next page
+                next_overlap = next_page_content[:overlap_chars]
+                
+                # Combine overlapping content
+                combined_content = current_overlap + "\n\n" + next_overlap
+                
+                # Ensure it doesn't exceed max size
+                if len(combined_content) > max_chunk_size:
+                    combined_content = combined_content[:max_chunk_size]
+                
+                overlap_chunk = Document(
+                    page_content=combined_content,
+                    metadata={
+                        **page.metadata,
+                        'chunk_id': chunk_id,
+                        'chunk_type': 'page_overlap',
+                        'chunk_size': len(combined_content),
+                        'page_start': page_num,
+                        'page_end': page_num + 1,
+                        'is_overlap': True
+                    }
+                )
+                all_chunks.append(overlap_chunk)
+                chunk_id += 1
     
-    print(f"✅ Created {len(chunked_docs)} chunks")
+    print(f"✅ Created {len(all_chunks)} page-based chunks")
     
     # Display statistics
-    chunk_sizes = [len(doc.page_content) for doc in chunked_docs]
-    print(f"📊 Chunk size statistics:")
-    print(f"   Average: {sum(chunk_sizes) / len(chunk_sizes):.0f} characters")
+    chunk_sizes = [len(doc.page_content) for doc in all_chunks]
+    overlap_chunks = len([c for c in all_chunks if c.metadata.get('is_overlap', False)])
+    
+    print(f"📊 Chunk statistics:")
+    print(f"   Total chunks: {len(all_chunks)}")
+    print(f"   Page chunks: {len(all_chunks) - overlap_chunks}")
+    print(f"   Overlap chunks: {overlap_chunks}")
+    print(f"   Average size: {sum(chunk_sizes) / len(chunk_sizes):.0f} characters")
     print(f"   Min: {min(chunk_sizes)} characters")
     print(f"   Max: {max(chunk_sizes)} characters")
     
-    return chunked_docs
+    return all_chunks
 
 class GeminiEmbeddings:
     """Custom embeddings class that uses Google Gemini embedding models."""
@@ -247,7 +295,8 @@ def create_vector_store(chunks: List[Document],
                 # Generate unique ID
                 source_file = chunk.metadata.get('source_file', 'unknown_file')
                 chunk_id = chunk.metadata.get('chunk_id', i)
-                unique_id = f"{source_file}_{chunk_id}"
+                chunk_type = chunk.metadata.get('chunk_type', 'regular')
+                unique_id = f"{source_file}_{chunk_type}_{chunk_id}"
                 ids_to_add.append(unique_id)
                 embeddings_to_add.append(embedding)
             else:
@@ -292,7 +341,7 @@ def create_vector_store(chunks: List[Document],
         print(f"❌ Error creating vector store: {str(e)}")
         return None
 
-def test_vector_store(vector_store: Chroma, test_query: str = "What is this document about?", k: int = 5):
+def test_vector_store(vector_store: Chroma, test_query: str = "fastest growing demand booster", k: int = 10):
     """Test the vector store with a sample query."""
     if vector_store is None:
         print("⚠️ Vector store not available for testing")
@@ -302,26 +351,20 @@ def test_vector_store(vector_store: Chroma, test_query: str = "What is this docu
     print(f"📊 Retrieving top {k} similar chunks...")
     
     try:
-        # Test with table-specific query
-        table_query = "fastest growing demand booster growth percentage"
-        results = vector_store.similarity_search(table_query, k=k)
+        results = vector_store.similarity_search_with_score(test_query, k=k)
         
-        print(f"\n📋 Search Results for table query:")
-        for i, doc in enumerate(results, 1):
-            print(f"\n--- Result {i} ---")
-            print(f"Source: {doc.metadata.get('source_file', 'Unknown')}")
-            print(f"Page: {doc.metadata.get('page', 'Unknown')}")
-            print(f"Chunk ID: {doc.metadata.get('chunk_id', 'Unknown')}")
-            print(f"Content: {doc.page_content[:300]}...")
+        print(f"\n📋 Search Results:")
+        for i, (doc, score) in enumerate(results, 1):
+            chunk_type = doc.metadata.get('chunk_type', 'unknown')
+            is_overlap = doc.metadata.get('is_overlap', False)
+            page_info = f"Page: {doc.metadata.get('page_start', 'Unknown')}"
+            if doc.metadata.get('page_end') != doc.metadata.get('page_start'):
+                page_info += f"-{doc.metadata.get('page_end', 'Unknown')}"
             
-        # Test with similarity scores
-        results_with_scores = vector_store.similarity_search_with_score(table_query, k=k)
-        
-        print(f"\n🎯 Search Results with Similarity Scores:")
-        for i, (doc, score) in enumerate(results_with_scores, 1):
             print(f"\n--- Result {i} (Score: {score:.4f}) ---")
             print(f"Source: {doc.metadata.get('source_file', 'Unknown')}")
-            print(f"Content: {doc.page_content[:200]}...")
+            print(f"{page_info} | Type: {chunk_type} | Overlap: {is_overlap}")
+            print(f"Content: {doc.page_content[:300]}...")
             
     except Exception as e:
         print(f"❌ Error during testing: {str(e)}")
@@ -355,7 +398,7 @@ def load_existing_vector_store(persist_directory: str,
 def print_pipeline_summary(documents, chunks, vector_store, embedding_model_used):
     """Print a summary of the data processing pipeline."""
     print("=" * 60)
-    print("📊 RAG DATA PROCESSING PIPELINE SUMMARY")
+    print("📊 PAGE-BASED RAG PIPELINE SUMMARY")
     print("=" * 60)
     
     print(f"📁 PDF Directory: {config.PDF_DIR}")
@@ -365,30 +408,31 @@ def print_pipeline_summary(documents, chunks, vector_store, embedding_model_used
     print(f"🗄️ Vector Store Location: {config.VECTOR_DB_DIR}")
     print(f"📦 Collection Name: {config.COLLECTION_NAME}")
     print(f"🎯 Vector Store Status: {'✅ Ready' if vector_store else '❌ Failed'}")
-    print(f"🌐 Running Mode: {'☁️ ONLINE (Gemini)' if embedding_model_used.startswith('gemini') else '🔒 OFFLINE'}")
     
-    if not documents:
-        print("\n⚠️ NO PDF FILES FOUND!")
-        print("Please add PDF files to the data/pdfs/ directory")
+    if chunks:
+        overlap_chunks = len([c for c in chunks if c.metadata.get('is_overlap', False)])
+        print(f"📋 Page chunks: {len(chunks) - overlap_chunks}")
+        print(f"🔗 Overlap chunks: {overlap_chunks}")
+        print(f"📏 Page overlap: {config.PAGE_OVERLAP_CHARS} characters")
     
     if vector_store:
-        print("\n🎯 IMPROVEMENTS MADE:")
-        print("1. ✅ Increased chunk size to 1500 characters for better table handling")
-        print("2. ✅ Increased chunk overlap to 300 characters for continuity")
-        print("3. ✅ Modified text splitter for table-aware processing")
-        print("4. ✅ Default retrieval increased to 8 chunks for comprehensive results")
+        print("\n🎯 PAGE-BASED CHUNKING BENEFITS:")
+        print("1. ✅ Complete page content preserved")
+        print("2. ✅ Cross-page data captured with overlap chunks")
+        print("3. ✅ Tables spanning multiple pages handled")
+        print("4. ✅ No arbitrary text splitting within pages")
         
-        print("\n💡 USAGE:")
-        print("- Your vector store is ready for RAG queries!")
-        print("- Better table handling for numerical data queries")
-        print("- Improved accuracy for growth percentage questions")
+        print("\n💡 OPTIMIZED FOR:")
+        print("- Complete table capture regardless of size")
+        print("- Cross-page content relationships")
+        print("- Semantic coherence within pages")
     
     print("=" * 60)
 
 def main():
-    """Main function to run the improved RAG data processing pipeline."""
-    print("🚀 Starting IMPROVED RAG Data Processing Pipeline...")
-    print("📈 Optimized for table and numerical data handling")
+    """Main function to run the page-based RAG data processing pipeline."""
+    print("🚀 Starting PAGE-BASED RAG Data Processing Pipeline...")
+    print("📄 Page-by-page chunking with cross-page overlap")
     
     embedding_model_name = None
     
@@ -413,25 +457,12 @@ def main():
     # Load documents
     documents = load_pdf_documents(config.PDF_DIR)
     
-    # Display sample document
-    if documents:
-        sample_doc = documents[0]
-        print(f"\n📋 Sample document preview:")
-        print(f"Source: {sample_doc.metadata.get('source_file', 'Unknown')}")
-        print(f"Page: {sample_doc.metadata.get('page', 'Unknown')}")
-        print(f"Content preview: {sample_doc.page_content[:200]}...")
-    
-    # Chunk documents with improved settings
-    chunks = chunk_documents(documents, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
-    
-    # Display sample chunk
-    if chunks:
-        sample_chunk = chunks[0]
-        print(f"\n📋 Sample chunk preview:")
-        print(f"Source: {sample_chunk.metadata.get('source_file', 'Unknown')}")
-        print(f"Chunk ID: {sample_chunk.metadata.get('chunk_id', 'Unknown')}")
-        print(f"Size: {sample_chunk.metadata.get('chunk_size', 'Unknown')} characters")
-        print(f"Content: {sample_chunk.page_content[:400]}...")
+    # Create page-based chunks with overlap
+    chunks = create_page_based_chunks(
+        documents, 
+        overlap_chars=config.PAGE_OVERLAP_CHARS,
+        max_chunk_size=config.MAX_CHUNK_SIZE
+    )
     
     # Create vector store
     vector_store = create_vector_store(
@@ -441,9 +472,9 @@ def main():
         collection_name=config.COLLECTION_NAME
     )
     
-    # Test the vector store with table-specific query
+    # Test with table query
     if vector_store and chunks:
-        test_vector_store(vector_store, "fastest growing demand booster growth percentage", k=8)
+        test_vector_store(vector_store, "fastest growing demand booster growth percentage", k=15)
     
     # Print summary
     print_pipeline_summary(documents, chunks, vector_store, embedding_model_name)

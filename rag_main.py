@@ -1,14 +1,15 @@
-# RAG Main - Complete RAG system with automatic data processing
-# This checks if vector store exists, if not calls data_processing.py, then proceeds with RAG
+# Robust RAG System with Intelligent Chunk Merging and Table Handling
 
 import os
 import time
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
 from google import genai
 from langchain_chroma import Chroma
 import chromadb
+import re
+from collections import defaultdict
 
 # Load environment variables
 load_dotenv()
@@ -64,15 +65,137 @@ class GeminiEmbeddings:
             raise ValueError("Gemini client not loaded")
         return self._embed_with_retry(text)
 
-class RAGSystem:
-    """Complete RAG system with automatic data processing and retrieval/generation."""
+class SmartChunkMerger:
+    """Intelligently merge overlapping and related chunks to reconstruct complete information."""
+    
+    @staticmethod
+    def detect_table_content(text: str) -> bool:
+        """Detect if content contains tabular data."""
+        table_indicators = [
+            r'\b\d+\s+\w+.*\d+%',  # Pattern like "1 Company Name ... 25%"
+            r'Top\s+\d+\s+.*Accounts',  # "Top 20 ... Accounts"
+            r'\d+\.\d+\s+\d+\.\d+',  # Multiple decimal numbers
+            r'\b\d+%\s+\d+%',  # Multiple percentages
+            r'Growth.*%.*\n.*\d+%',  # Growth percentage patterns
+        ]
+        
+        for pattern in table_indicators:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+    
+    @staticmethod
+    def calculate_overlap_score(chunk1: str, chunk2: str) -> float:
+        """Calculate content overlap between two chunks."""
+        # Split into words for comparison
+        words1 = set(chunk1.lower().split())
+        words2 = set(chunk2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / len(union) if union else 0.0
+    
+    @classmethod
+    def group_related_chunks(cls, chunks: List[Dict]) -> List[List[Dict]]:
+        """Group chunks that are related and should be merged."""
+        if not chunks:
+            return []
+        
+        # Group by page first
+        page_groups = defaultdict(list)
+        for chunk in chunks:
+            page = chunk['metadata'].get('page', 'unknown')
+            source = chunk['metadata'].get('source_file', 'unknown')
+            key = f"{source}_{page}"
+            page_groups[key].append(chunk)
+        
+        # Within each page, group by content similarity
+        final_groups = []
+        
+        for page_key, page_chunks in page_groups.items():
+            if len(page_chunks) == 1:
+                final_groups.append(page_chunks)
+                continue
+            
+            # Sort chunks by chunk_id to maintain order
+            page_chunks.sort(key=lambda x: x['metadata'].get('chunk_id', 0))
+            
+            # Check if any chunks contain table content
+            has_table = any(cls.detect_table_content(chunk['content']) for chunk in page_chunks)
+            
+            if has_table:
+                # If page has table content, merge all chunks from this page
+                final_groups.append(page_chunks)
+            else:
+                # For non-table content, group by overlap
+                groups = []
+                for chunk in page_chunks:
+                    added_to_group = False
+                    for group in groups:
+                        # Check overlap with any chunk in the group
+                        for group_chunk in group:
+                            if cls.calculate_overlap_score(chunk['content'], group_chunk['content']) > 0.3:
+                                group.append(chunk)
+                                added_to_group = True
+                                break
+                        if added_to_group:
+                            break
+                    
+                    if not added_to_group:
+                        groups.append([chunk])
+                
+                final_groups.extend(groups)
+        
+        return final_groups
+    
+    @classmethod
+    def merge_chunk_group(cls, chunk_group: List[Dict]) -> Dict:
+        """Merge a group of related chunks into a single chunk."""
+        if len(chunk_group) == 1:
+            return chunk_group[0]
+        
+        # Sort by chunk_id to maintain logical order
+        sorted_chunks = sorted(chunk_group, key=lambda x: x['metadata'].get('chunk_id', 0))
+        
+        # Combine content intelligently
+        combined_content = ""
+        seen_content = set()
+        
+        for chunk in sorted_chunks:
+            content = chunk['content'].strip()
+            
+            # Avoid exact duplicates
+            if content not in seen_content:
+                combined_content += content + "\n\n"
+                seen_content.add(content)
+        
+        # Create merged chunk with combined metadata
+        merged_chunk = {
+            'rank': sorted_chunks[0]['rank'],
+            'content': combined_content.strip(),
+            'score': min(chunk['score'] for chunk in sorted_chunks),  # Use best score
+            'metadata': sorted_chunks[0]['metadata'].copy(),
+            'source_file': sorted_chunks[0]['source_file'],
+            'page': sorted_chunks[0]['page'],
+            'chunk_id': f"merged_{sorted_chunks[0]['chunk_id']}_to_{sorted_chunks[-1]['chunk_id']}",
+            'merged_from': len(sorted_chunks)
+        }
+        
+        return merged_chunk
+
+class RobustRAGSystem:
+    """RAG system with intelligent chunk merging for complete table reconstruction."""
     
     def __init__(self, 
                  vector_store_path: str = "data/vector_store",
                  collection_name: str = "pdf_documents",
                  embedding_model: str = "gemini-embedding-exp-03-07",
                  generation_model: str = "gemini-2.5-pro"):
-        """Initialize the RAG system with automatic setup."""
+        """Initialize the robust RAG system."""
         self.vector_store_path = vector_store_path
         self.collection_name = collection_name
         self.embedding_model = embedding_model
@@ -82,6 +205,7 @@ class RAGSystem:
         self.embeddings = None
         self.vector_store = None
         self.genai_client = None
+        self.chunk_merger = SmartChunkMerger()
         
         self._setup_system()
     
@@ -91,11 +215,9 @@ class RAGSystem:
             if not os.path.exists(self.vector_store_path):
                 return False
             
-            # Try to load the vector store
             client = chromadb.PersistentClient(path=self.vector_store_path)
             collections = client.list_collections()
             
-            # Check if our collection exists
             collection_exists = any(col.name == self.collection_name for col in collections)
             
             if collection_exists:
@@ -111,14 +233,13 @@ class RAGSystem:
             return False
     
     def _setup_system(self):
-        """Initialize RAG system - process data if needed, then setup components."""
-        print("🚀 Initializing RAG System...")
+        """Initialize RAG system with robust table handling."""
+        print("🚀 Initializing Robust RAG System with Smart Chunk Merging...")
         
         # Check if vector store exists
         if not self._check_vector_store_exists():
             print("📋 Vector store not found or empty. Running data processing pipeline...")
             
-            # Run data processing pipeline
             documents, chunks, vector_store = run_data_processing()
             
             if not vector_store:
@@ -162,22 +283,22 @@ class RAGSystem:
             print(f"❌ Failed to initialize generation model: {str(e)}")
             return
         
-        print("✅ RAG System ready!")
+        print("✅ Robust RAG System ready with intelligent chunk merging!")
     
-    def retrieve_relevant_chunks(self, query: str, k: int = 8) -> List[Dict]:
-        """Retrieve relevant document chunks for a query."""
+    def retrieve_and_merge_chunks(self, query: str, k: int = 15) -> List[Dict]:
+        """Retrieve chunks and intelligently merge related ones."""
         if not self.vector_store:
             print("❌ Vector store not available")
             return []
         
         try:
-            print(f"🔍 Searching for relevant chunks...")
+            print(f"🔍 Searching for relevant chunks (retrieving {k})...")
             
-            # Perform similarity search with scores
+            # Retrieve more chunks to ensure we get complete information
             results = self.vector_store.similarity_search_with_score(query, k=k)
             
-            # Format results
-            relevant_chunks = []
+            # Format initial results
+            raw_chunks = []
             for i, (doc, score) in enumerate(results):
                 chunk_info = {
                     'rank': i + 1,
@@ -188,35 +309,57 @@ class RAGSystem:
                     'page': doc.metadata.get('page', 'Unknown'),
                     'chunk_id': doc.metadata.get('chunk_id', 'Unknown')
                 }
-                relevant_chunks.append(chunk_info)
+                raw_chunks.append(chunk_info)
             
-            print(f"📊 Retrieved {len(relevant_chunks)} relevant chunks")
-            return relevant_chunks
+            print(f"📊 Retrieved {len(raw_chunks)} raw chunks")
+            
+            # Group and merge related chunks
+            print("🔗 Analyzing chunk relationships and merging...")
+            chunk_groups = self.chunk_merger.group_related_chunks(raw_chunks)
+            
+            merged_chunks = []
+            for group in chunk_groups:
+                merged_chunk = self.chunk_merger.merge_chunk_group(group)
+                merged_chunks.append(merged_chunk)
+            
+            # Sort by relevance score
+            merged_chunks.sort(key=lambda x: x['score'])
+            
+            print(f"✅ Merged into {len(merged_chunks)} intelligent chunks")
+            
+            # Log merging info
+            for chunk in merged_chunks:
+                if 'merged_from' in chunk:
+                    print(f"   📋 Merged chunk from {chunk['merged_from']} original chunks (Page: {chunk['page']})")
+            
+            return merged_chunks
             
         except Exception as e:
-            print(f"❌ Error during retrieval: {str(e)}")
+            print(f"❌ Error during retrieval and merging: {str(e)}")
             return []
     
-    def generate_response(self, query: str, relevant_chunks: List[Dict], max_retries: int = 3) -> str:
-        """Generate a response using Gemini 2.5 Pro based on query and relevant chunks."""
+    def generate_response(self, query: str, merged_chunks: List[Dict], max_retries: int = 3) -> str:
+        """Generate response using merged chunks."""
         if not self.genai_client:
             return "❌ Generation model not available"
         
-        if not relevant_chunks:
+        if not merged_chunks:
             return "❌ No relevant information found to answer your query."
         
-        # Prepare context from relevant chunks
+        # Prepare context from merged chunks
         context_parts = []
-        for chunk in relevant_chunks:
+        for chunk in merged_chunks:
             source_info = f"Source: {chunk['source_file']}, Page: {chunk['page']}"
+            if 'merged_from' in chunk:
+                source_info += f" (Merged from {chunk['merged_from']} chunks)"
             context_parts.append(f"[{source_info}]\n{chunk['content']}\n")
         
         context = "\n".join(context_parts)
         
-        # Create prompt for Gemini 2.5 Pro - Enhanced for numerical data and tables
+        # Enhanced prompt for complete data analysis
         prompt = f"""You are a helpful AI assistant that answers questions based on provided document context. 
 
-Use the following context to answer the user's question. Pay special attention to numerical data, percentages, and tabular information.
+The context below contains COMPLETE and MERGED information from related document sections to ensure no data is missed.
 
 CONTEXT:
 {context}
@@ -224,14 +367,13 @@ CONTEXT:
 QUESTION: {query}
 
 INSTRUCTIONS:
-- Provide a clear, comprehensive answer based on the context
-- When dealing with numerical data or percentages, carefully examine ALL provided data
-- If the question asks for "fastest growing" or "highest percentage", find the MAXIMUM value across all data
-- Include relevant details and specifics from the documents
-- If you reference specific information, mention which document/page it comes from
-- If the context doesn't contain enough information to fully answer the question, acknowledge this
-- Be precise with numerical values and percentages
-- Double-check your answer against the provided data
+- Analyze ALL the provided data comprehensively
+- When dealing with numerical data, percentages, or tables, examine EVERY entry
+- If asking for "fastest growing", "highest", "maximum", or "best", find the ABSOLUTE maximum across ALL data
+- The context has been intelligently merged to provide complete information - use all of it
+- Include specific values, percentages, and source references
+- Be precise with numerical values and double-check against ALL provided data
+- If multiple similar data points exist, compare them all and identify the true maximum/minimum
 
 ANSWER:"""
 
@@ -250,7 +392,6 @@ ANSWER:"""
                     }
                 )
                 
-                # Extract the generated text
                 if response.candidates and len(response.candidates) > 0:
                     generated_text = response.candidates[0].content.parts[0].text
                     print(f"✅ Response generated successfully")
@@ -272,16 +413,16 @@ ANSWER:"""
         
         return "❌ Failed to generate response"
     
-    def query(self, question: str, k: int = 8) -> Dict:
-        """Complete RAG query: retrieve relevant chunks and generate response."""
+    def query(self, question: str, k: int = 15) -> Dict:
+        """Complete robust RAG query with intelligent chunk merging."""
         print("=" * 80)
-        print(f"🔍 RAG QUERY: {question}")
+        print(f"🔍 ROBUST RAG QUERY: {question}")
         print("=" * 80)
         
-        # Step 1: Retrieve relevant chunks
-        relevant_chunks = self.retrieve_relevant_chunks(question, k=k)
+        # Step 1: Retrieve and merge chunks
+        merged_chunks = self.retrieve_and_merge_chunks(question, k=k)
         
-        if not relevant_chunks:
+        if not merged_chunks:
             return {
                 'query': question,
                 'answer': "❌ No relevant information found in the document.",
@@ -291,15 +432,16 @@ ANSWER:"""
         
         # Step 2: Generate response
         print(f"\n🤖 GENERATING RESPONSE...")
-        answer = self.generate_response(question, relevant_chunks)
+        answer = self.generate_response(question, merged_chunks)
         
         # Prepare sources info
         sources = []
-        for chunk in relevant_chunks:
+        for chunk in merged_chunks:
             source_info = {
                 'file': chunk['source_file'],
                 'page': chunk['page'],
-                'score': chunk['score']
+                'score': chunk['score'],
+                'merged_from': chunk.get('merged_from', 1)
             }
             if source_info not in sources:
                 sources.append(source_info)
@@ -308,50 +450,52 @@ ANSWER:"""
             'query': question,
             'answer': answer,
             'sources': sources,
-            'chunks_retrieved': len(relevant_chunks),
-            'relevant_chunks': relevant_chunks
+            'chunks_retrieved': len(merged_chunks),
+            'merged_chunks': merged_chunks
         }
         
         print(f"\n📝 FINAL ANSWER:")
         print(answer)
         
-        print(f"\n📚 SOURCES:")
+        print(f"\n📚 SOURCES (Merged):")
         for source in sources:
-            print(f"- {source['file']}, Page: {source['page']} (Score: {source['score']:.4f})")
+            merge_info = f" (Merged from {source['merged_from']} chunks)" if source['merged_from'] > 1 else ""
+            print(f"- {source['file']}, Page: {source['page']} (Score: {source['score']:.4f}){merge_info}")
         
         print("=" * 80)
         return result
     
     def is_ready(self) -> bool:
-        """Check if the RAG system is ready to process queries."""
+        """Check if the robust RAG system is ready."""
         return all([
             self.embeddings is not None,
             self.vector_store is not None,
             self.genai_client is not None
         ])
 
+# Alias for backward compatibility
+RAGSystem = RobustRAGSystem
+
 def main():
-    """Main function for testing the RAG system."""
-    # Initialize RAG system
-    rag_system = RAGSystem()
+    """Test the robust RAG system."""
+    rag_system = RobustRAGSystem()
     
     if not rag_system.is_ready():
-        print("❌ RAG system initialization failed!")
+        print("❌ Robust RAG system initialization failed!")
         return
     
-    # Test with sample queries
-    sample_queries = [
-        "Which is the fastest growing demand booster?",
-        "What are the key financial metrics mentioned?",
-        "Summarize the executive summary",
-        "What are the main business highlights?"
+    # Test queries
+    test_queries = [
+        "Which is the fastest growing demand booster based on growth %?",
+        "What are all the growth percentages in the top 20 demand booster accounts?",
+        "List all companies with growth over 100%"
     ]
     
-    print("\n🧪 Testing RAG System...")
-    for query in sample_queries:
-        result = rag_system.query(query, k=3)
+    print("\n🧪 Testing Robust RAG System...")
+    for query in test_queries:
+        result = rag_system.query(query, k=15)
         print(f"\n{'='*20} NEXT QUERY {'='*20}")
-        time.sleep(1)  # Small delay between queries
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
