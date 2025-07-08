@@ -9,9 +9,10 @@ wheels/
 # Virtual environments
 .venv
 *.pdf
-
+venv
 # Creds
 .env
+data
 
 # Data
 data/vector_store/
