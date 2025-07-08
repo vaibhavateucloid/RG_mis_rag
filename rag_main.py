@@ -118,42 +118,20 @@ class SubQueryGenerator:
     
     def generate_sub_queries(self, original_query: str, context: str = "") -> List[str]:
         """Generate sub-queries for deep financial analysis."""
-        
-        prompt = f"""You are a Chartered Financial Analyst. Given the user's analytical query about RateGain financial data, generate a list of specific sub-queries that need to be answered to provide a comprehensive analysis.
-
-BUSINESS CONTEXT:
-- RateGain has 3 segments: DaaS (Travel BI, Hospi BI), Distribution (Enterprise Connectivity, Channel Manager, Uno), Martech (BCV, MHS, Adara)
-- Available data: Revenue, EBITDA, Costs, Top Accounts, NRR, GRR, Monetization, Department Spending
-- Time period: April 2024 - March 2025
-
-CONVERSATION CONTEXT:
-{context}
-
-USER QUERY: {original_query}
-
-Generate 5-8 specific sub-queries that will help analyze this comprehensively. Include queries about:
-1. Base metrics (EBITDA, Revenue for specific periods)
-2. Supporting data (Top accounts, costs, department spending)
-3. Comparative analysis if multiple periods/products mentioned
-
-Return only the sub-queries, one per line, without numbering or explanations."""
-
+        prompt = f"""You are a Chartered Financial Analyst. Given the user's analytical query about RateGain financial data, generate a list of specific sub-queries that need to be answered to provide a comprehensive analysis.\n\nBUSINESS CONTEXT:\n- RateGain has 3 segments: DaaS (Travel BI, Hospi BI), Distribution (Enterprise Connectivity, Channel Manager, Uno), Martech (BCV, MHS, Adara)\n- Available data: Revenue, EBITDA, Costs, Top Accounts, NRR, GRR, Monetization, Department Spending\n- Time period: April 2024 - March 2025\n\nCONVERSATION CONTEXT:\n{context}\n\nUSER QUERY: {original_query}\n\nGenerate 5-8 specific sub-queries that will help analyze this comprehensively. Include queries about:\n1. Base metrics (EBITDA, Revenue for specific periods)\n2. Supporting data (Top accounts, costs, department spending)\n3. Comparative analysis if multiple periods/products mentioned\n\nReturn only the sub-queries, one per line, without numbering or explanations."""
         try:
             response = self.genai_client.models.generate_content(
                 model="gemini-2.5-pro",
                 contents=prompt,
-                config={'temperature': 0.3, 'max_output_tokens': 5000}
+                config={'temperature': 0.3, 'max_output_tokens': 10000}
             )
-            
             if response and response.candidates and len(response.candidates) > 0:
                 sub_queries_text = response.candidates[0].content.parts[0].text
                 sub_queries = [q.strip() for q in sub_queries_text.split('\n') if q.strip()]
                 return sub_queries[:8]  # Limit to 8 sub-queries
-            
         except Exception as e:
             logging.error(f"Error generating sub-queries: {e}")
-        
-            return []
+        return []
 
 class CFAAgent:
     """Chartered Financial Analyst agent for deep financial analysis."""
@@ -166,31 +144,30 @@ class CFAAgent:
     
     def analyze_with_thinking(self, query: str, context: str = "") -> Generator[Dict, None, None]:
         """Perform deep financial analysis with live thinking display."""
-        
+        # Start analysis
+        yield {"type": "thinking", "content": "🧠 **THINKING**: Starting CFA analysis..."}
         logging.info("🧠 **THINKING**: Starting CFA analysis...")
-        
         # Generate sub-queries
+        yield {"type": "thinking", "content": "🔍 **THINKING**: Generating analytical sub-queries..."}
         logging.info("🔍 **THINKING**: Generating analytical sub-queries...")
         sub_queries = self.sub_query_generator.generate_sub_queries(query, context)
-        
         if not sub_queries:
+            # Only yield fallback step if no sub-queries
+            yield {"type": "thinking", "content": "⚠️ **THINKING**: Using fallback analysis approach..."}
             logging.warning("⚠️ **THINKING**: Using fallback analysis approach...")
             sub_queries = [query]  # Fallback to original query
-        
-        # Display generated sub-queries
-        sub_queries_text = "\n".join([f"• {q}" for q in sub_queries])
-        logging.info(f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:\n{sub_queries_text}")
-        
-        # Collect all data
+        # Yield header for sub-queries
+        yield {"type": "thinking", "content": f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:"}
+        logging.info(f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:")
+        # Yield each sub-query as a separate bullet point
+        for sq in sub_queries:
+            yield {"type": "thinking", "content": f"• {sq}"}
+        # Collect all data (no UI yield for progress, only logging)
         all_retrieved_data = []
-        
         for i, sub_query in enumerate(sub_queries, 1):
             logging.info(f"🔍 **THINKING**: Processing sub-query {i}/{len(sub_queries)}: {sub_query}")
-            
-            # Retrieve relevant chunks
             try:
                 results = self.vector_store.similarity_search_with_score(sub_query, k=7)
-                
                 for doc, score in results:
                     chunk_data = {
                         'content': doc.page_content,
@@ -199,12 +176,9 @@ class CFAAgent:
                         'sub_query': sub_query
                     }
                     all_retrieved_data.append(chunk_data)
-                
                 logging.info(f"✅ **THINKING**: Retrieved {len(results)} chunks for sub-query {i}")
-                
             except Exception as e:
                 logging.error(f"❌ **THINKING**: Error retrieving data for sub-query {i}: {str(e)}")
-        
         # Remove duplicates and sort by relevance
         unique_data = []
         seen_content = set()
@@ -212,16 +186,9 @@ class CFAAgent:
             if data['content'] not in seen_content:
                 unique_data.append(data)
                 seen_content.add(data['content'])
-        
-        unique_data.sort(key=lambda x: x['score'])
-        
         logging.info(f"📊 **THINKING**: Compiled {len(unique_data)} unique chunks for analysis")
-        
-        # Generate comprehensive analysis
         logging.info("🤖 **THINKING**: Performing comprehensive financial analysis...")
-        
         analysis = self._generate_cfa_analysis(query, unique_data, context)
-        
         logging.info("✅ **THINKING**: Analysis complete!")
         yield {"type": "answer", "content": analysis, "sources": self._format_sources(unique_data)}
     
@@ -278,7 +245,7 @@ ANALYSIS:"""
                 config={
                     'temperature': 0.1,
                     'top_p': 0.8,
-                    'max_output_tokens': 10000,
+                    'max_output_tokens': 20000,
                 }
             )
             # Defensive check for response structure
@@ -450,7 +417,7 @@ class EnhancedRAGSystem:
                 response = self.genai_client.models.generate_content(
                     model=self.generation_model,
                     contents=prompt,
-                    config={'temperature': 0.1, 'max_output_tokens': 5000}
+                    config={'temperature': 0.1, 'max_output_tokens': 10000}
                 )
                 # Defensive check for response structure
                 if response and hasattr(response, "candidates") and response.candidates and \

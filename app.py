@@ -41,6 +41,46 @@ def add_logo_btn1():
         unsafe_allow_html=True
     )
 
+def display_thinking_step(step_content):
+    """Display a single thinking step with appropriate styling."""
+    if "🧠 **THINKING**:" in step_content:
+        step_text = step_content.replace("🧠 **THINKING**: ", "").strip()
+        st.markdown(f"🧠 **Starting analysis...** {step_text}")
+    elif "🔍 **THINKING**:" in step_content:
+        step_text = step_content.replace("🔍 **THINKING**: ", "").strip()
+        st.markdown(f"🔍 **Searching...** {step_text}")
+    elif "📋 **THINKING**:" in step_content:
+        step_text = step_content.replace("📋 **THINKING**: ", "").strip()
+        if "sub-queries:" in step_text:
+            # Handle sub-queries display specially
+            parts = step_text.split("sub-queries:")
+            if len(parts) > 1:
+                st.markdown(f"📋 **Planning...** {parts[0].strip()} sub-queries:")
+                # Display sub-queries in a nice format
+                sub_queries_part = parts[1].strip()
+                if sub_queries_part:
+                    st.markdown(sub_queries_part)
+        else:
+            st.markdown(f"📋 **Planning...** {step_text}")
+    elif "✅ **THINKING**:" in step_content:
+        step_text = step_content.replace("✅ **THINKING**: ", "").strip()
+        st.markdown(f"✅ **Progress...** {step_text}")
+    elif "📊 **THINKING**:" in step_content:
+        step_text = step_content.replace("📊 **THINKING**: ", "").strip()
+        st.markdown(f"📊 **Analyzing...** {step_text}")
+    elif "🤖 **THINKING**:" in step_content:
+        step_text = step_content.replace("🤖 **THINKING**: ", "").strip()
+        st.markdown(f"🤖 **Generating...** {step_text}")
+    elif "⚠️ **THINKING**:" in step_content:
+        step_text = step_content.replace("⚠️ **THINKING**: ", "").strip()
+        st.warning(f"⚠️ {step_text}")
+    elif "❌ **THINKING**:" in step_content:
+        step_text = step_content.replace("❌ **THINKING**: ", "").strip()
+        st.error(f"❌ {step_text}")
+    else:
+        # Fallback for any other format
+        st.markdown(step_content)
+
 def main():
     add_logo_btn1()
     logging.info("Application started.")
@@ -48,10 +88,8 @@ def main():
     # --- Sidebar: Instructions & Inputs & Buttons ---
     instructions_md = """
     ### Instructions:
-    1. **CFA-Powered Financial Analysis**: Ask direct questions for quick facts or analytical questions for deep insights.
-    2. **Live Thinking**: Watch the AI's reasoning process for analytical queries.
-    3. **RateGain Context**: Covers DaaS (Travel BI, Hospi BI), Distribution (Enterprise Connectivity, Channel Manager, Uno), and Martech (BCV, MHS, Adara).
-    4. **Time Period**: April 2024 - March 2025 data available.
+    1. Ask direct questions for quick facts or analytical questions for deep insights.
+    2. April 2024 - March 2025 data available.
     """
     st.sidebar.markdown(instructions_md)
 
@@ -73,7 +111,7 @@ def main():
                 # Display thinking steps if they exist
                 with st.expander("🧠 Thinking Process", expanded=False):
                     for step in message["thinking_steps"]:
-                        st.markdown(step)
+                        display_thinking_step(step)
             
             st.markdown(message["content"])
             
@@ -111,7 +149,7 @@ def main():
                 enhanced_question = question
             
             # Initialize containers for live updates
-            thinking_container = st.empty()
+            thinking_container = st.container()
             answer_container = st.empty()
             sources_container = st.empty()
             
@@ -119,22 +157,44 @@ def main():
             final_answer = ""
             final_sources = []
             
+            # Create a placeholder for thinking steps
+            thinking_placeholder = thinking_container.empty()
+            spinner_placeholder = None
             # Process query with live thinking display
             for response in rag.query(enhanced_question, conversation_context):
                 if response["type"] == "thinking":
                     thinking_steps.append(response["content"])
-                    # Update thinking display in real-time
-                    with thinking_container.container():
-                        st.markdown("🧠 **Live Thinking Process:**")
-                        for step in thinking_steps:
-                            st.markdown(step)
+                    # Update thinking display in real-time with collapsible container
+                    with thinking_placeholder.container():
+                        with st.expander("🧠 **Live Thinking Process**", expanded=True):
+                            subquery_end_idx = None
+                            for idx, step in enumerate(thinking_steps):
+                                display_thinking_step(step)
+                                # Detect the last sub-query bullet point
+                                if step.startswith("• "):
+                                    subquery_end_idx = idx
+                            # Show spinner after the last sub-query bullet point
+                            if subquery_end_idx is not None and len(thinking_steps) == subquery_end_idx + 1:
+                                spinner_placeholder = st.empty()
+                                with spinner_placeholder.container():
+                                    st.info("⏳ Analyzing and generating answer...")
+                            else:
+                                if spinner_placeholder:
+                                    spinner_placeholder.empty()
                 
                 elif response["type"] == "answer":
                     final_answer = response["content"]
                     final_sources = response.get("sources", [])
                     
-                    # Clear thinking and show final answer
-                    thinking_container.empty()
+                    # Collapse the thinking process and show final answer
+                    with thinking_placeholder.container():
+                        with st.expander("🧠 **Thinking Process**", expanded=False):
+                            for step in thinking_steps:
+                                display_thinking_step(step)
+                    
+                    if spinner_placeholder:
+                        spinner_placeholder.empty()
+                    
                     answer_container.markdown(final_answer)
                     
                     # Show sources
@@ -144,7 +204,10 @@ def main():
                                 st.markdown(f"**{i}.** {source['file']}, Page: {source['page']} (Relevance: {source['score']:.4f})")
                 
                 elif response["type"] == "error":
-                    thinking_container.empty()
+                    # Clear thinking and show error
+                    if spinner_placeholder:
+                        spinner_placeholder.empty()
+                    thinking_placeholder.empty()
                     answer_container.error(response["content"])
                     final_answer = response["content"]
                     logging.error(f"Error response from RAG system: {response['content']}")
@@ -168,10 +231,6 @@ def main():
     st.sidebar.markdown("---")
     if rag.is_ready():
         st.sidebar.success("✅ CFA System Ready")
-        st.sidebar.markdown("**System Status:**")
-        st.sidebar.markdown("- 🧠 CFA Agent: Active")
-        st.sidebar.markdown("- 🔍 Query Classification: Active")
-        st.sidebar.markdown("- 📊 Vector Store: Loaded")
     else:
         st.sidebar.error("❌ System Not Ready")
     logging.info("Application finished.")
