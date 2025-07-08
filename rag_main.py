@@ -324,12 +324,14 @@ CONVERSATION CONTEXT:
 
 USER QUERY: {original_query}
 
-Generate 8-10 specific sub-queries that will help analyze this comprehensively. Focus especially on:
+Generate 8-10 specific sub-queries that will help analyze this comprehensively. Focus especially on the following metrics as per relevance:
 - Base metrics (EBITDA, Revenue for specific periods)
 - Comparative analysis if multiple periods/products mentioned
 - NRR (Net Revenue Retention) and GRR (Gross Revenue Retention)
 - Top accounts, Department Spending, COGS, Monetization
 - "Rule of 40", Sales multiple, LTV2CAC (LTV to CAC ration)
+- Investment Summary, Cashflow, M-o-M Cash Movement, Collection, Day of sales outstanding
+- Monetisation for different products and services
 
 Only generate sub-queries that are directly relevant to the user's query and the provided business context. Do NOT go off topic or include unrelated financial concepts.
 
@@ -446,12 +448,14 @@ USER QUERY: {query}
 
 ANALYSIS REQUIREMENTS:
 1. **Executive Summary**: Start with key findings
-2. **Detailed Financial Analysis**: 
+2. **Detailed Financial Analysis**: (Include the data points mentioned below as per relevance)
    - Analyze EBITDA, Revenue, Costs systematically
    - Identify trends, variances, and performance drivers
    - Examine top accounts and customer dynamics
    - Review department spending patterns
    - Emphasize NRR (Net Revenue Retention), GRR (Gross Revenue Retention), Retention, top accounts, "rule of 40", sales multiple, and LTV2CAC (LTV to CAC ratio) wherever relevant
+   - Investment Summary, Cashflow, M-o-M Cash Movement, Collection, Day of sales outstanding whatever is relevant
+   - Monetisation for different products and services
 3. **Root Cause Analysis**: Explain the "why" behind numbers
 4. **Business Implications**: What this means for RateGain
 5. **Data-Driven Insights**: Include specific numbers, percentages, and comparisons
