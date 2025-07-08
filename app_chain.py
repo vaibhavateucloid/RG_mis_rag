@@ -487,7 +487,7 @@ async def retrieve_sources(sources):
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Main message handler with real-time thinking stream and live animation."""
+    """Main message handler with collapsible thinking display and proper final message rendering."""
     logging.info(f"User submitted question: {message.content}")
     
     # Get RAG system from session
@@ -504,7 +504,7 @@ async def main(message: cl.Message):
     chat_history.append({"role": "user", "content": message.content})
     logging.info(f"Appended user message. Updated chat_history: {chat_history}")
     
-    # Enhanced question with context for follow-ups (for display, not for backend)
+    # Enhanced question with context for follow-ups
     enhanced_question = message.content
     logging.info(f"Passing to rag.query: enhanced_question={enhanced_question}, chat_history={chat_history}")
     
@@ -513,35 +513,18 @@ async def main(message: cl.Message):
     final_sources = []
     thinking_content = ""
     step_count = 0
-    animation_frames = ["⏳", "⏳.", "⏳..", "⏳...", "⏳....", "⏳....."]
-    animation_idx = 0
-    animation_running = True
     
-    # Create a single step for the entire thinking process
+    # Create a collapsible step for the thinking process
     async with cl.Step(name="🧠 Live Analysis Process", type="llm", show_input=False) as thinking_step:
         thinking_step.input = f"Analyzing: {message.content}"
+        thinking_step.output = "🔄 Starting analysis..."
         
-        async def animate():
-            nonlocal animation_idx, animation_running, thinking_content, step_count
-            while animation_running:
-                dots = animation_frames[animation_idx % len(animation_frames)]
-                if thinking_content:
-                    thinking_step.output = f"{thinking_content}\n\n{dots} <span style='color:gray'>(Live analysis in progress)</span>\n\n**Steps processed: {step_count}**"
-                else:
-                    thinking_step.output = f"{dots} <span style='color:gray'>(Live analysis in progress)</span>"
-                animation_idx += 1
-                await asyncio.sleep(0.4)
-        # Start animation in the background
-        animation_task = asyncio.create_task(animate())
         try:
-            # Log the type and repr of the object returned by rag.query
-            query_result = rag.query(enhanced_question, chat_history)
-            logging.info(f"rag.query returned object of type: {type(query_result)}, repr: {repr(query_result)}")
-            
             # Process query with real-time thinking display
             logging.info("About to enter async for loop over rag.query result...")
-            async for response in query_result:
+            async for response in rag.query(enhanced_question, chat_history):
                 logging.info(f"Received response from rag.query: {response}")
+                
                 if response["type"] == "thinking":
                     step_count += 1
                     formatted_thinking = format_thinking_content(response["content"])
@@ -551,7 +534,9 @@ async def main(message: cl.Message):
                         thinking_content += f"\n\n---\n\n{formatted_thinking}"
                     else:
                         thinking_content = formatted_thinking
-                    # The animation task will update the output
+                    
+                    # Update the step output in real-time - THIS IS THE KEY FOR COLLAPSIBLE THINKING
+                    thinking_step.output = f"{thinking_content}\n\n**Steps processed: {step_count}**"
                     
                     # Small delay for better UX
                     await asyncio.sleep(0.05)
@@ -564,48 +549,60 @@ async def main(message: cl.Message):
                     chat_history.append({"role": "assistant", "content": final_answer})
                     cl.user_session.set("chat_history", chat_history)
                     
-                    animation_running = False
-                    await animation_task
-                    # Set final step output
+                    # Set final step output - This completes the collapsible thinking box
                     thinking_step.output = f"{thinking_content}\n\n✅ **Analysis Complete!** ({step_count} steps processed)"
                     
                     logging.info(f"Assistant response generated: {final_answer}")
+                    break  # Exit the loop once we get the answer
                     
                 elif response["type"] == "error":
                     error_msg = response["content"]
                     logging.error(f"Error response from RAG system: {error_msg}")
                     
-                    animation_running = False
-                    await animation_task
                     # Update step with error
                     thinking_step.output = f"{thinking_content}\n\n❌ **Error occurred**: {error_msg}"
                     
-                    # Send error message
+                    # Send error message and return
                     await cl.Message(content=f"❌ **Error**: {error_msg}").send()
                     return
+            
             logging.info("Exited async for loop over rag.query result.")
+            
         except Exception as e:
-            animation_running = False
-            await animation_task
             error_msg = f"An error occurred: {str(e)}"
             logging.error(f"Exception in main: {error_msg}")
             
             # Update step with exception
             thinking_step.output = f"{thinking_content}\n\n❌ **Exception occurred**: {error_msg}"
             
-            # Send error message
+            # Send error message and return
             await cl.Message(content=f"❌ **Error**: {error_msg}").send()
             return
     
-    # Send the final answer
+    # CRITICAL: Add delay AFTER step context is closed to ensure proper UI rendering
+    await asyncio.sleep(0.3)  # Wait for step to fully close and render
+    
+    # Send the final answer OUTSIDE the step context
     if final_answer:
-        await cl.Message(content=final_answer).send()
-        
-        # Send sources as a separate collapsible step if available
-        if final_sources:
-            async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
-                sources_text = await retrieve_sources(final_sources)
-                sources_step.output = f"**Retrieved {len(final_sources)} sources:**\n\n{sources_text}"
+        try:
+            await cl.Message(content=final_answer).send()
+            logging.info("Final message sent successfully to UI")
+            
+            # Add delay before sources
+            await asyncio.sleep(0.2)
+            
+            # Send sources as a separate collapsible step if available
+            if final_sources:
+                async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
+                    sources_text = await retrieve_sources(final_sources)
+                    sources_step.output = f"**Retrieved {len(final_sources)} sources:**\n\n{sources_text}"
+                    
+        except Exception as e:
+            logging.error(f"Error sending final message: {e}")
+            await cl.Message(content=f"❌ Error displaying results: {str(e)}").send()
+    else:
+        logging.warning("No final answer to send")
+        await cl.Message(content="❌ No response generated").send()
 
 @cl.on_chat_end
 async def end():
