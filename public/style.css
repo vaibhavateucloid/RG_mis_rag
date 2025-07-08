@@ -1,0 +1,250 @@
+/* Claude-like Landing Page CSS for Chainlit */
+
+/* Global Styles */
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+    background-color: #fafafa;
+    color: #2d3748;
+}
+
+/* Hide default elements when empty */
+.MuiContainer-root:empty {
+    display: none !important;
+}
+
+/* Main container centering */
+.MuiContainer-root {
+    max-width: 800px !important;
+    margin: 0 auto !important;
+    padding: 0 24px !important;
+}
+
+/* Chat container centering */
+.MuiBox-root {
+    max-width: 100% !important;
+}
+
+/* Landing page layout */
+.chainlit-app:not(.has-messages) {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+/* Welcome screen customization */
+.chainlit-app:not(.has-messages)::before {
+    content: "🧠 CFA System";
+    font-size: 2.5rem;
+    font-weight: 600;
+    color: #2d3748;
+    margin-bottom: 2rem;
+    text-align: center;
+}
+
+/* Chat messages container */
+.MuiStack-root {
+    max-width: 700px !important;
+    margin: 0 auto !important;
+}
+
+/* Input container styling */
+.MuiBox-root > .MuiStack-root:last-child {
+    max-width: 600px !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+}
+
+/* Input field styling */
+.MuiInputBase-root {
+    background-color: #f7f7f7 !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 12px !important;
+    padding: 12px 16px !important;
+    font-size: 16px !important;
+    line-height: 1.5 !important;
+    min-height: 48px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1) !important;
+    transition: all 0.2s ease !important;
+}
+
+.MuiInputBase-root:hover {
+    border-color: #cbd5e0 !important;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1) !important;
+}
+
+.MuiInputBase-root.Mui-focused {
+    border-color: #667eea !important;
+    box-shadow: 0 2px 6px rgba(102, 126, 234, 0.1) !important;
+}
+
+/* Input field text */
+.MuiInputBase-input {
+    color: #2d3748 !important;
+    font-size: 16px !important;
+    padding: 0 !important;
+}
+
+.MuiInputBase-input::placeholder {
+    color: #a0aec0 !important;
+    opacity: 1 !important;
+}
+
+/* Send button styling */
+.MuiIconButton-root {
+    background-color: #ff6b9d !important;
+    color: white !important;
+    border-radius: 8px !important;
+    padding: 8px !important;
+    margin-left: 8px !important;
+    transition: all 0.2s ease !important;
+}
+
+.MuiIconButton-root:hover {
+    background-color: #f56565 !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Attachment button styling */
+.MuiIconButton-root[aria-label="Attach"] {
+    background-color: transparent !important;
+    color: #a0aec0 !important;
+    margin-left: 0 !important;
+    margin-right: 8px !important;
+}
+
+.MuiIconButton-root[aria-label="Attach"]:hover {
+    background-color: #f7fafc !important;
+    color: #4a5568 !important;
+    transform: none !important;
+}
+
+/* Header styling */
+.MuiToolbar-root {
+    background-color: transparent !important;
+    box-shadow: none !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+}
+
+/* Message styling */
+.MuiPaper-root {
+    background-color: white !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 12px !important;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
+    margin: 8px 0 !important;
+}
+
+/* Message content */
+.MuiTypography-root {
+    color: #2d3748 !important;
+    line-height: 1.6 !important;
+}
+
+/* Center the entire app when no messages */
+.chainlit-app:not(.has-messages) .MuiContainer-root {
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: center !important;
+    align-items: center !important;
+    min-height: 100vh !important;
+    text-align: center !important;
+}
+
+/* Custom logo/title positioning */
+.chainlit-app:not(.has-messages) .MuiContainer-root::before {
+    content: "🧠 CFA System" !important;
+    font-size: 2.5rem !important;
+    font-weight: 600 !important;
+    color: #2d3748 !important;
+    margin-bottom: 3rem !important;
+    display: block !important;
+}
+
+/* Center input in welcome state */
+.chainlit-app:not(.has-messages) .MuiStack-root {
+    width: 100% !important;
+    max-width: 600px !important;
+    margin: 0 auto !important;
+}
+
+/* Welcome state input container */
+.chainlit-app:not(.has-messages) .MuiBox-root > .MuiStack-root:last-child {
+    width: 100% !important;
+    max-width: 600px !important;
+    margin: 0 auto !important;
+}
+
+/* Loading states */
+.MuiCircularProgress-root {
+    color: #667eea !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #c1c1c1;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #a1a1a1;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .MuiContainer-root {
+        padding: 0 16px !important;
+    }
+    
+    .chainlit-app:not(.has-messages) .MuiContainer-root::before {
+        font-size: 2rem !important;
+        margin-bottom: 2rem !important;
+    }
+    
+    .MuiStack-root {
+        max-width: 100% !important;
+    }
+    
+    .MuiBox-root > .MuiStack-root:last-child {
+        max-width: 100% !important;
+    }
+}
+
+/* Animation for smooth transitions */
+.MuiBox-root,
+.MuiStack-root,
+.MuiContainer-root {
+    transition: all 0.3s ease !important;
+}
+
+/* Hide sidebar when not needed */
+.MuiDrawer-root {
+    display: none !important;
+}
+
+/* Custom styling for the very first load */
+.chainlit-app:not(.has-messages) {
+    background: linear-gradient(135deg, #fafafa 0%, #f4f6f8 100%) !important;
+}
+
+/* Focus states */
+.MuiInputBase-root:focus-within {
+    border-color: #667eea !important;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1) !important;
+}
