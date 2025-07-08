@@ -26,8 +26,8 @@ print("✅ All imports successful!")
 
 class Config:
     # Paths
-    PDF_DIR = "data/pdfs"
-    VECTOR_DB_DIR = "data/vector_store"
+    PDF_DIR = "data"
+    VECTOR_DB_DIR = "vector_store"
     MODELS_DIR = "models"
     
     # Page-based chunking parameters

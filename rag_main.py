@@ -1,21 +1,31 @@
-# Robust RAG System with Intelligent Chunk Merging and Table Handling
+# Enhanced RAG System with CFA Agent and Self-Query Mechanism
 
 import os
 import time
+import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Generator
 from dotenv import load_dotenv
 from google import genai
 from langchain_chroma import Chroma
 import chromadb
-import re
 from collections import defaultdict
+from datetime import datetime
+from enum import Enum
+import logging
 
 # Load environment variables
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
 # Import data processing pipeline
 from data_processing import main as run_data_processing, load_existing_vector_store, Config
+
+class QueryType(Enum):
+    DIRECT_FACTUAL = "direct_factual"
+    ANALYTICAL = "analytical"
 
 class GeminiEmbeddings:
     """Custom embeddings class that uses Google Gemini embedding models."""
@@ -33,7 +43,7 @@ class GeminiEmbeddings:
                 raise ValueError("GOOGLE_API_KEY environment variable not set.")
             self.client = genai.Client(api_key=api_key)
         except Exception as e:
-            print(f"❌ Error initializing Gemini client: {str(e)}")
+            logging.error(f"❌ Error initializing Gemini client: {str(e)}")
             raise
     
     def _embed_with_retry(self, text: str, max_retries: int = 6, base_delay: float = 1.0) -> List[float]:
@@ -44,18 +54,24 @@ class GeminiEmbeddings:
                     model=self.model_name,
                     contents=text
                 )
-                return result.embeddings[0].values
+                # Defensive check for result structure
+                if result and hasattr(result, 'embeddings') and result.embeddings and \
+                   hasattr(result.embeddings[0], 'values') and result.embeddings[0].values is not None:
+                    return list(result.embeddings[0].values)
+                else:
+                    logging.error(f"❌ Unexpected embedding response: {result}")
+                    return []
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                     delay = base_delay * (2 ** attempt)
-                    print(f"⏳ Rate limit hit. Waiting {delay:.1f}s before retry {attempt + 1}/{max_retries}")
+                    logging.warning(f"⏳ Rate limit hit. Waiting {delay:.1f}s before retry {attempt + 1}/{max_retries}")
                     time.sleep(delay)
                     if attempt == max_retries - 1:
-                        print(f"❌ Max retries reached for text: {text[:50]}...")
+                        logging.error(f"❌ Max retries reached for text: {text[:50]}...")
                         return []
                 else:
-                    print(f"❌ Error embedding text: {str(e)}")
+                    logging.error(f"❌ Error embedding text: {str(e)}")
                     return []
         return []
     
@@ -65,137 +81,247 @@ class GeminiEmbeddings:
             raise ValueError("Gemini client not loaded")
         return self._embed_with_retry(text)
 
-class SmartChunkMerger:
-    """Intelligently merge overlapping and related chunks to reconstruct complete information."""
+class QueryClassifier:
+    """Classifies queries as direct factual or analytical requiring CFA agent."""
     
     @staticmethod
-    def detect_table_content(text: str) -> bool:
-        """Detect if content contains tabular data."""
-        table_indicators = [
-            r'\b\d+\s+\w+.*\d+%',  # Pattern like "1 Company Name ... 25%"
-            r'Top\s+\d+\s+.*Accounts',  # "Top 20 ... Accounts"
-            r'\d+\.\d+\s+\d+\.\d+',  # Multiple decimal numbers
-            r'\b\d+%\s+\d+%',  # Multiple percentages
-            r'Growth.*%.*\n.*\d+%',  # Growth percentage patterns
+    def classify_query(query: str) -> QueryType:
+        """Classify the query type based on intent."""
+        analytical_keywords = [
+            'compare', 'analyze', 'analyse', 'why', 'reason', 'cause', 'trend', 'growth', 'decline',
+            'increase', 'decrease', 'performance', 'vs', 'versus', 'difference', 'impact',
+            'correlation', 'relationship', 'factor', 'driver', 'explain', 'understand'
         ]
         
-        for pattern in table_indicators:
-            if re.search(pattern, text, re.IGNORECASE):
-                return True
-        return False
-    
-    @staticmethod
-    def calculate_overlap_score(chunk1: str, chunk2: str) -> float:
-        """Calculate content overlap between two chunks."""
-        # Split into words for comparison
-        words1 = set(chunk1.lower().split())
-        words2 = set(chunk2.lower().split())
+        query_lower = query.lower()
         
-        if not words1 or not words2:
-            return 0.0
+        # Check for analytical keywords
+        if any(keyword in query_lower for keyword in analytical_keywords):
+            return QueryType.ANALYTICAL
         
-        intersection = words1.intersection(words2)
-        union = words1.union(words2)
+        # Check for multiple segments/products mentioned (likely comparative)
+        segments = ['daas', 'distribution', 'martech']
+        products = ['travel bi', 'hospi bi', 'enterprise connectivity', 'channel manager', 
+                   'uno', 'bcv', 'mhs', 'adara']
         
-        return len(intersection) / len(union) if union else 0.0
-    
-    @classmethod
-    def group_related_chunks(cls, chunks: List[Dict]) -> List[List[Dict]]:
-        """Group chunks that are related and should be merged."""
-        if not chunks:
-            return []
+        mentioned_count = sum(1 for item in segments + products if item in query_lower)
+        if mentioned_count > 1:
+            return QueryType.ANALYTICAL
         
-        # Group by page first
-        page_groups = defaultdict(list)
-        for chunk in chunks:
-            page = chunk['metadata'].get('page', 'unknown')
-            source = chunk['metadata'].get('source_file', 'unknown')
-            key = f"{source}_{page}"
-            page_groups[key].append(chunk)
-        
-        # Within each page, group by content similarity
-        final_groups = []
-        
-        for page_key, page_chunks in page_groups.items():
-            if len(page_chunks) == 1:
-                final_groups.append(page_chunks)
-                continue
-            
-            # Sort chunks by chunk_id to maintain order
-            page_chunks.sort(key=lambda x: x['metadata'].get('chunk_id', 0))
-            
-            # Check if any chunks contain table content
-            has_table = any(cls.detect_table_content(chunk['content']) for chunk in page_chunks)
-            
-            if has_table:
-                # If page has table content, merge all chunks from this page
-                final_groups.append(page_chunks)
-            else:
-                # For non-table content, group by overlap
-                groups = []
-                for chunk in page_chunks:
-                    added_to_group = False
-                    for group in groups:
-                        # Check overlap with any chunk in the group
-                        for group_chunk in group:
-                            if cls.calculate_overlap_score(chunk['content'], group_chunk['content']) > 0.3:
-                                group.append(chunk)
-                                added_to_group = True
-                                break
-                        if added_to_group:
-                            break
-                    
-                    if not added_to_group:
-                        groups.append([chunk])
-                
-                final_groups.extend(groups)
-        
-        return final_groups
-    
-    @classmethod
-    def merge_chunk_group(cls, chunk_group: List[Dict]) -> Dict:
-        """Merge a group of related chunks into a single chunk."""
-        if len(chunk_group) == 1:
-            return chunk_group[0]
-        
-        # Sort by chunk_id to maintain logical order
-        sorted_chunks = sorted(chunk_group, key=lambda x: x['metadata'].get('chunk_id', 0))
-        
-        # Combine content intelligently
-        combined_content = ""
-        seen_content = set()
-        
-        for chunk in sorted_chunks:
-            content = chunk['content'].strip()
-            
-            # Avoid exact duplicates
-            if content not in seen_content:
-                combined_content += content + "\n\n"
-                seen_content.add(content)
-        
-        # Create merged chunk with combined metadata
-        merged_chunk = {
-            'rank': sorted_chunks[0]['rank'],
-            'content': combined_content.strip(),
-            'score': min(chunk['score'] for chunk in sorted_chunks),  # Use best score
-            'metadata': sorted_chunks[0]['metadata'].copy(),
-            'source_file': sorted_chunks[0]['source_file'],
-            'page': sorted_chunks[0]['page'],
-            'chunk_id': f"merged_{sorted_chunks[0]['chunk_id']}_to_{sorted_chunks[-1]['chunk_id']}",
-            'merged_from': len(sorted_chunks)
-        }
-        
-        return merged_chunk
+        return QueryType.DIRECT_FACTUAL
 
-class RobustRAGSystem:
-    """RAG system with intelligent chunk merging for complete table reconstruction."""
+class SubQueryGenerator:
+    """Generates sub-queries for CFA deep analysis."""
+    
+    def __init__(self, genai_client):
+        self.genai_client = genai_client
+    
+    def generate_sub_queries(self, original_query: str, context: str = "") -> List[str]:
+        """Generate sub-queries for deep financial analysis."""
+        
+        prompt = f"""You are a Chartered Financial Analyst. Given the user's analytical query about RateGain financial data, generate a list of specific sub-queries that need to be answered to provide a comprehensive analysis.
+
+BUSINESS CONTEXT:
+- RateGain has 3 segments: DaaS (Travel BI, Hospi BI), Distribution (Enterprise Connectivity, Channel Manager, Uno), Martech (BCV, MHS, Adara)
+- Available data: Revenue, EBITDA, Costs, Top Accounts, NRR, GRR, Monetization, Department Spending
+- Time period: April 2024 - March 2025
+
+CONVERSATION CONTEXT:
+{context}
+
+USER QUERY: {original_query}
+
+Generate 5-8 specific sub-queries that will help analyze this comprehensively. Include queries about:
+1. Base metrics (EBITDA, Revenue for specific periods)
+2. Supporting data (Top accounts, costs, department spending)
+3. Comparative analysis if multiple periods/products mentioned
+
+Return only the sub-queries, one per line, without numbering or explanations."""
+
+        try:
+            response = self.genai_client.models.generate_content(
+                model="gemini-2.5-pro",
+                contents=prompt,
+                config={'temperature': 0.3, 'max_output_tokens': 5000}
+            )
+            
+            if response and response.candidates and len(response.candidates) > 0:
+                sub_queries_text = response.candidates[0].content.parts[0].text
+                sub_queries = [q.strip() for q in sub_queries_text.split('\n') if q.strip()]
+                return sub_queries[:8]  # Limit to 8 sub-queries
+            
+        except Exception as e:
+            logging.error(f"Error generating sub-queries: {e}")
+        
+            return []
+
+class CFAAgent:
+    """Chartered Financial Analyst agent for deep financial analysis."""
+    
+    def __init__(self, vector_store, embeddings, genai_client):
+        self.vector_store = vector_store
+        self.embeddings = embeddings
+        self.genai_client = genai_client
+        self.sub_query_generator = SubQueryGenerator(genai_client)
+    
+    def analyze_with_thinking(self, query: str, context: str = "") -> Generator[Dict, None, None]:
+        """Perform deep financial analysis with live thinking display."""
+        
+        logging.info("🧠 **THINKING**: Starting CFA analysis...")
+        
+        # Generate sub-queries
+        logging.info("🔍 **THINKING**: Generating analytical sub-queries...")
+        sub_queries = self.sub_query_generator.generate_sub_queries(query, context)
+        
+        if not sub_queries:
+            logging.warning("⚠️ **THINKING**: Using fallback analysis approach...")
+            sub_queries = [query]  # Fallback to original query
+        
+        # Display generated sub-queries
+        sub_queries_text = "\n".join([f"• {q}" for q in sub_queries])
+        logging.info(f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:\n{sub_queries_text}")
+        
+        # Collect all data
+        all_retrieved_data = []
+        
+        for i, sub_query in enumerate(sub_queries, 1):
+            logging.info(f"🔍 **THINKING**: Processing sub-query {i}/{len(sub_queries)}: {sub_query}")
+            
+            # Retrieve relevant chunks
+            try:
+                results = self.vector_store.similarity_search_with_score(sub_query, k=7)
+                
+                for doc, score in results:
+                    chunk_data = {
+                        'content': doc.page_content,
+                        'score': score,
+                        'metadata': doc.metadata,
+                        'sub_query': sub_query
+                    }
+                    all_retrieved_data.append(chunk_data)
+                
+                logging.info(f"✅ **THINKING**: Retrieved {len(results)} chunks for sub-query {i}")
+                
+            except Exception as e:
+                logging.error(f"❌ **THINKING**: Error retrieving data for sub-query {i}: {str(e)}")
+        
+        # Remove duplicates and sort by relevance
+        unique_data = []
+        seen_content = set()
+        for data in all_retrieved_data:
+            if data['content'] not in seen_content:
+                unique_data.append(data)
+                seen_content.add(data['content'])
+        
+        unique_data.sort(key=lambda x: x['score'])
+        
+        logging.info(f"📊 **THINKING**: Compiled {len(unique_data)} unique chunks for analysis")
+        
+        # Generate comprehensive analysis
+        logging.info("🤖 **THINKING**: Performing comprehensive financial analysis...")
+        
+        analysis = self._generate_cfa_analysis(query, unique_data, context)
+        
+        logging.info("✅ **THINKING**: Analysis complete!")
+        yield {"type": "answer", "content": analysis, "sources": self._format_sources(unique_data)}
+    
+    def _generate_cfa_analysis(self, query: str, retrieved_data: List[Dict], context: str) -> str:
+        """Generate comprehensive CFA analysis."""
+        
+        # Prepare context from retrieved data
+        context_parts = []
+        for data in retrieved_data:
+            source_info = f"Source: {data['metadata'].get('source_file', 'Unknown')}, Page: {data['metadata'].get('page', 'Unknown')}"
+            context_parts.append(f"[{source_info}]\n{data['content']}\n")
+        
+        full_context = "\n".join(context_parts)
+        
+        prompt = f"""You are a senior Chartered Financial Analyst (CFA) specializing in RateGain's financial performance. Provide a comprehensive financial analysis based on the data provided.
+
+BUSINESS STRUCTURE:
+- DaaS Segment: Travel BI, Hospi BI  
+- Distribution Segment: Enterprise Connectivity, Channel Manager, Uno
+- Martech Segment: BCV, MHS, Adara
+
+CONVERSATION CONTEXT:
+{context}
+
+FINANCIAL DATA:
+{full_context}
+
+USER QUERY: {query}
+
+ANALYSIS REQUIREMENTS:
+1. **Executive Summary**: Start with key findings
+2. **Detailed Financial Analysis**: 
+   - Analyze EBITDA, Revenue, Costs systematically
+   - Identify trends, variances, and performance drivers
+   - Examine top accounts and customer dynamics
+   - Review department spending patterns
+3. **Root Cause Analysis**: Explain the "why" behind numbers
+4. **Business Implications**: What this means for RateGain
+5. **Data-Driven Insights**: Include specific numbers, percentages, and comparisons
+
+IMPORTANT:
+- Be factually accurate with all numbers
+- Reference specific time periods correctly (FY 2024-25: Apr 2024 - Mar 2025)
+- Provide actionable business insights
+- Use professional financial analysis language
+- Include specific account names and financial figures when available
+
+ANALYSIS:"""
+
+        try:
+            response = self.genai_client.models.generate_content(
+                model="gemini-2.5-pro",
+                contents=prompt,
+                config={
+                    'temperature': 0.1,
+                    'top_p': 0.8,
+                    'max_output_tokens': 10000,
+                }
+            )
+            # Defensive check for response structure
+            if response and hasattr(response, "candidates") and response.candidates and \
+               hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts and \
+               response.candidates[0].content.parts[0] is not None and \
+               hasattr(response.candidates[0].content.parts[0], 'text') and response.candidates[0].content.parts[0].text is not None:
+                return response.candidates[0].content.parts[0].text
+            else:
+                logging.error(f"❌ Unexpected CFA analysis response: {response}")
+                return "❌ Unable to generate analysis"
+                
+        except Exception as e:
+            logging.error(f"❌ Error generating analysis: {str(e)}")
+            return "❌ Error generating analysis"
+    
+    def _format_sources(self, retrieved_data: List[Dict]) -> List[Dict]:
+        """Format sources for display."""
+        sources = []
+        seen_sources = set()
+        
+        for data in retrieved_data:
+            source_key = f"{data['metadata'].get('source_file', 'Unknown')}_{data['metadata'].get('page', 'Unknown')}"
+            if source_key not in seen_sources:
+                sources.append({
+                    'file': data['metadata'].get('source_file', 'Unknown'),
+                    'page': data['metadata'].get('page', 'Unknown'),
+                    'score': data['score']
+                })
+                seen_sources.add(source_key)
+        
+        return sorted(sources, key=lambda x: x['score'])[:10]  # Top 10 sources
+
+class EnhancedRAGSystem:
+    """Enhanced RAG system with CFA agent and intelligent query routing."""
     
     def __init__(self, 
-                 vector_store_path: str = "data/vector_store",
+                 vector_store_path: str = "vector_store",
                  collection_name: str = "pdf_documents",
                  embedding_model: str = "gemini-embedding-exp-03-07",
                  generation_model: str = "gemini-2.5-pro"):
-        """Initialize the robust RAG system."""
+        """Initialize the enhanced RAG system."""
         self.vector_store_path = vector_store_path
         self.collection_name = collection_name
         self.embedding_model = embedding_model
@@ -205,7 +331,8 @@ class RobustRAGSystem:
         self.embeddings = None
         self.vector_store = None
         self.genai_client = None
-        self.chunk_merger = SmartChunkMerger()
+        self.cfa_agent = None
+        self.query_classifier = QueryClassifier()
         
         self._setup_system()
     
@@ -223,39 +350,36 @@ class RobustRAGSystem:
             if collection_exists:
                 collection = client.get_collection(self.collection_name)
                 count = collection.count()
-                print(f"📊 Found existing vector store with {count} documents")
+                logging.info(f"📊 Found existing vector store with {count} documents")
                 return count > 0
             
             return False
             
         except Exception as e:
-            print(f"⚠️ Error checking vector store: {str(e)}")
+            logging.warning(f"⚠️ Error checking vector store: {str(e)}")
             return False
     
     def _setup_system(self):
-        """Initialize RAG system with robust table handling."""
-        print("🚀 Initializing Robust RAG System with Smart Chunk Merging...")
+        """Initialize enhanced RAG system."""
+        logging.info("🚀 Initializing Enhanced RAG System with CFA Agent...")
         
         # Check if vector store exists
         if not self._check_vector_store_exists():
-            print("📋 Vector store not found or empty. Running data processing pipeline...")
-            
+            logging.info("📋 Vector store not found or empty. Running data processing pipeline...")
             documents, chunks, vector_store = run_data_processing()
-            
             if not vector_store:
-                print("❌ Data processing failed. Cannot initialize RAG system.")
+                logging.error("❌ Data processing failed. Cannot initialize RAG system.")
                 return
-            
-            print("✅ Data processing completed successfully!")
+            logging.info("✅ Data processing completed successfully!")
         else:
-            print("✅ Vector store found. Loading existing data...")
+            logging.info("✅ Vector store found. Loading existing data...")
         
         # Initialize embedding model
         try:
             self.embeddings = GeminiEmbeddings(self.embedding_model)
-            print(f"✅ Embedding model loaded: {self.embedding_model}")
+            logging.info(f"✅ Embedding model loaded: {self.embedding_model}")
         except Exception as e:
-            print(f"❌ Failed to load embedding model: {str(e)}")
+            logging.error(f"❌ Failed to load embedding model: {str(e)}")
             return
         
         # Load vector store
@@ -266,10 +390,10 @@ class RobustRAGSystem:
                 collection_name=self.collection_name
             )
             if not self.vector_store:
-                print("❌ Failed to load vector store")
+                logging.error("❌ Failed to load vector store")
                 return
         except Exception as e:
-            print(f"❌ Failed to load vector store: {str(e)}")
+            logging.error(f"❌ Failed to load vector store: {str(e)}")
             return
         
         # Initialize generation client
@@ -278,224 +402,125 @@ class RobustRAGSystem:
             if not api_key:
                 raise ValueError("GOOGLE_API_KEY environment variable not set.")
             self.genai_client = genai.Client(api_key=api_key)
-            print(f"✅ Generation model initialized: {self.generation_model}")
+            logging.info(f"✅ Generation model initialized: {self.generation_model}")
         except Exception as e:
-            print(f"❌ Failed to initialize generation model: {str(e)}")
+            logging.error(f"❌ Failed to initialize generation model: {str(e)}")
             return
         
-        print("✅ Robust RAG System ready with intelligent chunk merging!")
+        # Initialize CFA agent
+        self.cfa_agent = CFAAgent(self.vector_store, self.embeddings, self.genai_client)
+        logging.info("✅ CFA Agent initialized")
+        
+        logging.info("✅ Enhanced RAG System ready!")
     
-    def retrieve_and_merge_chunks(self, query: str, k: int = 15) -> List[Dict]:
-        """Retrieve chunks and intelligently merge related ones."""
-        if not self.vector_store:
-            print("❌ Vector store not available")
-            return []
+    def query(self, question: str, context: str = "") -> Generator[Dict, None, None]:
+        """Process query with intelligent routing."""
+        if not self.is_ready():
+            yield {"type": "error", "content": "❌ RAG system not ready"}
+            return
         
-        try:
-            print(f"🔍 Searching for relevant chunks (retrieving {k})...")
-            
-            # Retrieve more chunks to ensure we get complete information
-            results = self.vector_store.similarity_search_with_score(query, k=k)
-            
-            # Format initial results
-            raw_chunks = []
-            for i, (doc, score) in enumerate(results):
-                chunk_info = {
-                    'rank': i + 1,
-                    'content': doc.page_content,
-                    'score': score,
-                    'metadata': doc.metadata,
-                    'source_file': doc.metadata.get('source_file', 'Unknown'),
-                    'page': doc.metadata.get('page', 'Unknown'),
-                    'chunk_id': doc.metadata.get('chunk_id', 'Unknown')
-                }
-                raw_chunks.append(chunk_info)
-            
-            print(f"📊 Retrieved {len(raw_chunks)} raw chunks")
-            
-            # Group and merge related chunks
-            print("🔗 Analyzing chunk relationships and merging...")
-            chunk_groups = self.chunk_merger.group_related_chunks(raw_chunks)
-            
-            merged_chunks = []
-            for group in chunk_groups:
-                merged_chunk = self.chunk_merger.merge_chunk_group(group)
-                merged_chunks.append(merged_chunk)
-            
-            # Sort by relevance score
-            merged_chunks.sort(key=lambda x: x['score'])
-            
-            print(f"✅ Merged into {len(merged_chunks)} intelligent chunks")
-            
-            # Log merging info
-            for chunk in merged_chunks:
-                if 'merged_from' in chunk:
-                    print(f"   📋 Merged chunk from {chunk['merged_from']} original chunks (Page: {chunk['page']})")
-            
-            return merged_chunks
-            
-        except Exception as e:
-            print(f"❌ Error during retrieval and merging: {str(e)}")
-            return []
-    
-    def generate_response(self, query: str, merged_chunks: List[Dict], max_retries: int = 3) -> str:
-        """Generate response using merged chunks."""
-        if not self.genai_client:
-            return "❌ Generation model not available"
+        # Classify query type
+        query_type = self.query_classifier.classify_query(question)
+        logging.info(f"📋 **PROCESSING**: Query type classified as {query_type.name}")
         
-        if not merged_chunks:
-            return "❌ No relevant information found to answer your query."
-        
-        # Prepare context from merged chunks
-        context_parts = []
-        for chunk in merged_chunks:
-            source_info = f"Source: {chunk['source_file']}, Page: {chunk['page']}"
-            if 'merged_from' in chunk:
-                source_info += f" (Merged from {chunk['merged_from']} chunks)"
-            context_parts.append(f"[{source_info}]\n{chunk['content']}\n")
-        
-        context = "\n".join(context_parts)
-        
-        # Enhanced prompt for complete data analysis
-        prompt = f"""You are a helpful AI assistant that answers questions based on provided document context. 
-
-The context below contains COMPLETE and MERGED information from related document sections to ensure no data is missed.
-
-CONTEXT:
-{context}
-
-QUESTION: {query}
-
-INSTRUCTIONS:
-- Analyze ALL the provided data comprehensively
-- When dealing with numerical data, percentages, or tables, examine EVERY entry
-- If asking for "fastest growing", "highest", "maximum", or "best", find the ABSOLUTE maximum across ALL data
-- The context has been intelligently merged to provide complete information - use all of it
-- Include specific values, percentages, and source references
-- Be precise with numerical values and double-check against ALL provided data
-- If multiple similar data points exist, compare them all and identify the true maximum/minimum
-
-ANSWER:"""
-
-        # Generate response with retry logic
-        for attempt in range(max_retries):
+        if query_type == QueryType.DIRECT_FACTUAL:
+            # Handle direct factual queries
+            logging.info("📋 **PROCESSING**: Direct factual query detected")
+            
             try:
-                print(f"🤖 Generating response with {self.generation_model}...")
+                results = self.vector_store.similarity_search_with_score(question, k=10)
+                logging.debug(f"✅ Direct factual query: Retrieved {len(results)} chunks")
                 
+                # Prepare context
+                context_parts = []
+                sources = []
+                for doc, score in results:
+                    source_info = f"Source: {doc.metadata.get('source_file', 'Unknown')}, Page: {doc.metadata.get('page', 'Unknown')}"
+                    context_parts.append(f"[{source_info}]\n{doc.page_content}\n")
+                    sources.append({
+                        'file': doc.metadata.get('source_file', 'Unknown'),
+                        'page': doc.metadata.get('page', 'Unknown'),
+                        'score': score
+                    })
+                
+                full_context = "\n".join(context_parts)
+                
+                # Generate direct answer
+                prompt = f"""You are a financial analyst assistant. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{context}\n\nFINANCIAL DATA:\n{full_context}\n\nUSER QUESTION: {question}\n\nProvide a direct, accurate answer with specific numbers and source references. Be concise but complete."""
                 response = self.genai_client.models.generate_content(
                     model=self.generation_model,
                     contents=prompt,
-                    config={
-                        'temperature': 0.1,
-                        'top_p': 0.8,
-                        'max_output_tokens': 2000,
-                    }
+                    config={'temperature': 0.1, 'max_output_tokens': 5000}
                 )
-                
-                if response.candidates and len(response.candidates) > 0:
-                    generated_text = response.candidates[0].content.parts[0].text
-                    print(f"✅ Response generated successfully")
-                    return generated_text
+                # Defensive check for response structure
+                if response and hasattr(response, "candidates") and response.candidates and \
+                   hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+                   hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts and \
+                   response.candidates[0].content.parts[0] is not None and \
+                   hasattr(response.candidates[0].content.parts[0], 'text') and response.candidates[0].content.parts[0].text is not None:
+                    answer = response.candidates[0].content.parts[0].text
+                    logging.info("✅ Direct factual query: Answer generated successfully")
+                    yield {"type": "answer", "content": answer, "sources": sources[:5]}
                 else:
-                    return "❌ No response generated"
+                    logging.error(f"❌ Direct factual query: Unexpected response: {response}")
+                    yield {"type": "error", "content": "❌ Unable to generate response"}
                 
             except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    delay = 2 ** attempt
-                    print(f"⏳ Rate limit hit. Waiting {delay}s before retry {attempt + 1}/{max_retries}")
-                    time.sleep(delay)
-                    if attempt == max_retries - 1:
-                        return f"❌ Failed to generate response after {max_retries} attempts due to rate limiting"
-                else:
-                    print(f"❌ Error generating response: {str(e)}")
-                    return f"❌ Error generating response: {str(e)}"
+                logging.error(f"❌ Error processing direct factual query: {str(e)}")
+                yield {"type": "error", "content": f"❌ Error processing query: {str(e)}"}
         
-        return "❌ Failed to generate response"
-    
-    def query(self, question: str, k: int = 15) -> Dict:
-        """Complete robust RAG query with intelligent chunk merging."""
-        print("=" * 80)
-        print(f"🔍 ROBUST RAG QUERY: {question}")
-        print("=" * 80)
-        
-        # Step 1: Retrieve and merge chunks
-        merged_chunks = self.retrieve_and_merge_chunks(question, k=k)
-        
-        if not merged_chunks:
-            return {
-                'query': question,
-                'answer': "❌ No relevant information found in the document.",
-                'sources': [],
-                'chunks_retrieved': 0
-            }
-        
-        # Step 2: Generate response
-        print(f"\n🤖 GENERATING RESPONSE...")
-        answer = self.generate_response(question, merged_chunks)
-        
-        # Prepare sources info
-        sources = []
-        for chunk in merged_chunks:
-            source_info = {
-                'file': chunk['source_file'],
-                'page': chunk['page'],
-                'score': chunk['score'],
-                'merged_from': chunk.get('merged_from', 1)
-            }
-            if source_info not in sources:
-                sources.append(source_info)
-        
-        result = {
-            'query': question,
-            'answer': answer,
-            'sources': sources,
-            'chunks_retrieved': len(merged_chunks),
-            'merged_chunks': merged_chunks
-        }
-        
-        print(f"\n📝 FINAL ANSWER:")
-        print(answer)
-        
-        print(f"\n📚 SOURCES (Merged):")
-        for source in sources:
-            merge_info = f" (Merged from {source['merged_from']} chunks)" if source['merged_from'] > 1 else ""
-            print(f"- {source['file']}, Page: {source['page']} (Score: {source['score']:.4f}){merge_info}")
-        
-        print("=" * 80)
-        return result
+        else:  # ANALYTICAL query
+            logging.info("🧠 **PROCESSING**: Analytical query detected - routing to CFA Agent")
+            
+            # Use CFA agent for deep analysis
+            yield from self.cfa_agent.analyze_with_thinking(question, context)
     
     def is_ready(self) -> bool:
-        """Check if the robust RAG system is ready."""
+        """Check if the enhanced RAG system is ready."""
         return all([
             self.embeddings is not None,
             self.vector_store is not None,
-            self.genai_client is not None
+            self.genai_client is not None,
+            self.cfa_agent is not None
         ])
 
-# Alias for backward compatibility
-RAGSystem = RobustRAGSystem
+# Alias for compatibility
+RAGSystem = EnhancedRAGSystem
 
 def main():
-    """Test the robust RAG system."""
-    rag_system = RobustRAGSystem()
+    """Test the enhanced RAG system."""
+    rag_system = EnhancedRAGSystem()
     
     if not rag_system.is_ready():
-        print("❌ Robust RAG system initialization failed!")
+        logging.error("❌ Enhanced RAG system initialization failed!")
         return
     
     # Test queries
     test_queries = [
-        "Which is the fastest growing demand booster based on growth %?",
-        "What are all the growth percentages in the top 20 demand booster accounts?",
-        "List all companies with growth over 100%"
+        "What was the GAAP revenue for Hospi BI in August 2024?",  # Direct
+        "Compare the EBITDA for Hospi BI and Travel BI in Q2 and Q3, analyze why there has been any increase or decrease"  # Analytical
     ]
     
-    print("\n🧪 Testing Robust RAG System...")
+    logging.info("\n🧪 Testing Enhanced RAG System...")
     for query in test_queries:
-        result = rag_system.query(query, k=15)
-        print(f"\n{'='*20} NEXT QUERY {'='*20}")
-        time.sleep(1)
+        logging.info(f"\n{'='*50}")
+        logging.info(f"QUERY: {query}")
+        logging.info('='*50)
+        
+        for response in rag_system.query(query):
+            if response["type"] == "thinking":
+                logging.info(response["content"])
+            elif response["type"] == "answer":
+                logging.info(f"\n📝 FINAL ANSWER:")
+                logging.info(response["content"])
+                if response.get("sources"):
+                    logging.info(f"\n📚 SOURCES:")
+                    for source in response["sources"]:
+                        logging.info(f"- {source['file']}, Page: {source['page']} (Score: {source['score']:.4f})")
+            elif response["type"] == "error":
+                logging.error(response["content"])
+        
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
