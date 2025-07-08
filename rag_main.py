@@ -1,4 +1,4 @@
-# Enhanced RAG System with CFA Agent and Self-Query Mechanism
+# Enhanced RAG System with CFA Agent and Executive Agent
 
 import os
 import time
@@ -9,10 +9,11 @@ from dotenv import load_dotenv
 from google import genai
 from langchain_chroma import Chroma
 import chromadb
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from enum import Enum
 import logging
+import typing
 
 # Load environment variables
 load_dotenv()
@@ -25,7 +26,8 @@ from data_processing import main as run_data_processing, load_existing_vector_st
 
 class QueryType(Enum):
     DIRECT_FACTUAL = "direct_factual"
-    ANALYTICAL = "analytical"
+    EXECUTIVE_ANALYTICAL = "executive_analytical"
+    DEEP_ANALYTICAL = "deep_analytical"
 
 class GeminiEmbeddings:
     """Custom embeddings class that uses Google Gemini embedding models."""
@@ -82,22 +84,57 @@ class GeminiEmbeddings:
         return self._embed_with_retry(text)
 
 class QueryClassifier:
-    """Classifies queries as direct factual or analytical requiring CFA agent."""
+    """Classifies queries as direct factual, executive analytical, or deep analytical."""
     
-    @staticmethod
-    def classify_query(query: str) -> QueryType:
-        """Classify the query type based on intent."""
-        analytical_keywords = [
-            'compare', 'analyze', 'analyse', 'why', 'reason', 'cause', 'trend', 'growth', 'decline',
-            'increase', 'decrease', 'performance', 'vs', 'versus', 'difference', 'impact',
-            'correlation', 'relationship', 'factor', 'driver', 'explain', 'understand'
-        ]
-        
+    def __init__(self):
+        self.conversation_history = deque(maxlen=5)  # Track last 5 turns
+    
+    def add_to_history(self, query: str, response_type: str):
+        """Add query and response type to conversation history."""
+        self.conversation_history.append({
+            'query': query,
+            'response_type': response_type,
+            'timestamp': datetime.now()
+        })
+    
+    def classify_query(self, query: str) -> QueryType:
+        """Classify the query type based on intent and conversation context."""
         query_lower = query.lower()
         
-        # Check for analytical keywords
+        # Check for deep analysis triggers
+        deep_analysis_keywords = [
+            'detailed analysis', 'deep dive', 'comprehensive analysis', 'elaborate',
+            'explain why', 'root cause', 'analyze further', 'tell me more',
+            'breakdown', 'deep analysis', 'thorough analysis', 'in-depth',
+            'detailed breakdown', 'comprehensive breakdown', 'full analysis'
+        ]
+        
+        # Check for follow-up indicators in context
+        followup_phrases = [
+            'elaborate', 'details', 'more about', 'explain this', 'why',
+            'how', 'what caused', 'dive deeper', 'expand on'
+        ]
+        
+        # Check if this is a follow-up to previous executive summary
+        if self.conversation_history:
+            last_response = self.conversation_history[-1]
+            if (last_response['response_type'] == 'executive_analytical' and
+                any(phrase in query_lower for phrase in followup_phrases)):
+                return QueryType.DEEP_ANALYTICAL
+        
+        # Check for explicit deep analysis requests
+        if any(keyword in query_lower for keyword in deep_analysis_keywords):
+            return QueryType.DEEP_ANALYTICAL
+        
+        # Check for analytical intent (executive level)
+        analytical_keywords = [
+            'compare', 'analyze', 'analyse', 'trend', 'growth', 'decline',
+            'increase', 'decrease', 'performance', 'vs', 'versus', 'difference', 
+            'impact', 'correlation', 'relationship', 'factor', 'driver'
+        ]
+        
         if any(keyword in query_lower for keyword in analytical_keywords):
-            return QueryType.ANALYTICAL
+            return QueryType.EXECUTIVE_ANALYTICAL
         
         # Check for multiple segments/products mentioned (likely comparative)
         segments = ['daas', 'distribution', 'martech']
@@ -106,9 +143,129 @@ class QueryClassifier:
         
         mentioned_count = sum(1 for item in segments + products if item in query_lower)
         if mentioned_count > 1:
-            return QueryType.ANALYTICAL
+            return QueryType.EXECUTIVE_ANALYTICAL
         
         return QueryType.DIRECT_FACTUAL
+
+class ExecutiveAgent:
+    """Executive-level analytical agent for concise, comprehensive insights."""
+    
+    def __init__(self, vector_store, embeddings, genai_client):
+        self.vector_store = vector_store
+        self.embeddings = embeddings
+        self.genai_client = genai_client
+    
+    async def analyze_executive_summary(self, query: str, context: str = "") -> typing.AsyncGenerator[Dict, None]:
+        """Perform executive-level analysis with concise insights."""
+        import asyncio
+        
+        # Do not yield thinking steps for executive agent, only yield the final answer
+        try:
+            # Retrieve relevant data
+            results = self.vector_store.similarity_search_with_score(query, k=10)
+            
+            # Prepare context from retrieved data
+            context_parts = []
+            sources = []
+            for doc, score in results:
+                context_parts.append(doc.page_content)
+                sources.append({
+                    'file': doc.metadata.get('source_file', 'Unknown'),
+                    'page': doc.metadata.get('page', 'Unknown'),
+                    'score': score
+                })
+            
+            full_context = "\n".join(context_parts)
+            
+            # Generate executive summary
+            analysis = self._generate_executive_analysis(query, full_context, context)
+            
+            yield {"type": "answer", "content": analysis, "sources": sources[:5]}
+            
+        except Exception as e:
+            logging.error(f"❌ Error in executive analysis: {str(e)}")
+            yield {"type": "error", "content": f"❌ Error generating executive summary: {str(e)}"}
+    
+    def _generate_executive_analysis(self, query: str, retrieved_context: str, conversation_context: str) -> str:
+        """Generate executive-level analysis with concise insights."""
+        
+        prompt = f"""You are a senior executive advisor for RateGain Travel Technologies, a global provider of SaaS solutions for travel and hospitality industry. Provide a concise executive summary (200-300 words) with key insights.
+
+ABOUT RATEGAIN:
+RateGain is a leading travel technology company serving 7000+ customers globally across hotels, airlines, car rentals, cruise lines, and travel agencies. The company operates through three main business segments:
+
+1. **DaaS (Data-as-a-Service)**: 
+   - Travel BI: Business intelligence for travel companies
+   - Hospi BI: Business intelligence for hospitality sector
+
+2. **Distribution**: 
+   - Enterprise Connectivity: Channel management solutions
+   - Channel Manager: Distribution channel optimization
+   - Uno: Unified booking platform
+
+3. **Martech (Marketing Technology)**:
+   - BCV (Brand Compete View): Competitive intelligence
+   - MHS (Marketing Hub Solutions): Marketing automation
+   - Adara: Data-driven marketing platform
+
+CONVERSATION CONTEXT:
+{conversation_context}
+
+FINANCIAL DATA:
+{retrieved_context}
+
+USER QUERY: {query}
+
+EXECUTIVE SUMMARY REQUIREMENTS:
+- Length: 200-300 words maximum
+- Format: Use bullet points for key insights
+- Use tables for comparative analysis when comparing multiple items
+- Include specific metrics and percentages
+- Focus on business impact and actionable insights
+- No inline source citations
+- Structure: Brief overview, key insights (3-5 bullet points), business implications
+
+RESPONSE FORMAT:
+## Executive Summary
+[2-3 sentence overview]
+
+## Key Insights
+• [Key finding 1 with specific metrics]
+• [Key finding 2 with trend analysis]
+• [Key finding 3 with business impact]
+
+## Business Implications
+[Brief strategic implications]
+
+---
+💡 *For detailed analysis, ask me to "elaborate" or "analyze further"*
+
+ANALYSIS:"""
+
+        try:
+            response = self.genai_client.models.generate_content(
+                model="gemini-2.5-pro",
+                contents=prompt,
+                config={
+                    'temperature': 0.2,
+                    'top_p': 0.8,
+                    'max_output_tokens': 8000,
+                }
+            )
+            
+            if response and hasattr(response, "candidates") and response.candidates and \
+               hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+                parts = response.candidates[0].content.parts
+                answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
+                return answer
+            else:
+                logging.error(f"❌ Unexpected executive analysis response: {response}")
+                return "❌ Unable to generate executive summary"
+                
+        except Exception as e:
+            logging.error(f"❌ Error generating executive analysis: {str(e)}")
+            return "❌ Error generating executive summary"
 
 class SubQueryGenerator:
     """Generates sub-queries for CFA deep analysis."""
@@ -118,7 +275,44 @@ class SubQueryGenerator:
     
     def generate_sub_queries(self, original_query: str, context: str = "") -> List[str]:
         """Generate sub-queries for deep financial analysis."""
-        prompt = f"""You are a Chartered Financial Analyst. Given the user's analytical query about RateGain financial data, generate a list of specific sub-queries that need to be answered to provide a comprehensive analysis.\n\nBUSINESS CONTEXT:\n- RateGain has 3 segments: DaaS (Travel BI, Hospi BI), Distribution (Enterprise Connectivity, Channel Manager, Uno), Martech (BCV, MHS, Adara)\n- Available data: Revenue, EBITDA, Costs, Top Accounts, NRR, GRR, Monetization, Department Spending\n- Time period: April 2024 - March 2025\n\nCONVERSATION CONTEXT:\n{context}\n\nUSER QUERY: {original_query}\n\nGenerate 5-8 specific sub-queries that will help analyze this comprehensively. Include queries about:\n1. Base metrics (EBITDA, Revenue for specific periods)\n2. Supporting data (Top accounts, costs, department spending)\n3. Comparative analysis if multiple periods/products mentioned\n\nReturn only the sub-queries, one per line, without numbering or explanations."""
+        prompt = f"""You are a Chartered Financial Analyst. Given the user's analytical query about RateGain financial data, generate a list of specific sub-queries that need to be answered to provide a comprehensive analysis.
+
+ABOUT RATEGAIN:
+RateGain is a leading travel technology company serving 7000+ customers globally across hotels, airlines, car rentals, cruise lines, and travel agencies. The company operates through three main business segments:
+
+1. **DaaS (Data-as-a-Service)**: 
+   - Travel BI: Business intelligence for travel companies
+   - Hospi BI: Business intelligence for hospitality sector
+
+2. **Distribution**: 
+   - Enterprise Connectivity: Channel management solutions
+   - Channel Manager: Distribution channel optimization
+   - Uno: Unified booking platform
+
+3. **Martech (Marketing Technology)**:
+   - BCV (Brand Compete View): Competitive intelligence
+   - MHS (Marketing Hub Solutions): Marketing automation
+   - Adara: Data-driven marketing platform
+
+AVAILABLE DATA: Revenue, EBITDA, Costs, Top Accounts, NRR (Net Revenue Retention), GRR (Gross Revenue Retention), Retention, Monetization, Department Spending, "rule of 40", sales multiple, LTV2CAC (LTV to CAC ratio)
+TIME PERIOD: April 2024 - March 2025
+
+CONVERSATION CONTEXT:
+{context}
+
+USER QUERY: {original_query}
+
+Generate 8-10 specific sub-queries that will help analyze this comprehensively. Focus especially on:
+- Base metrics (EBITDA, Revenue for specific periods)
+- Comparative analysis if multiple periods/products mentioned
+- NRR (Net Revenue Retention) and GRR (Gross Revenue Retention)
+- Top accounts, Department Spending, COGS, Monetization
+- "Rule of 40", Sales multiple, LTV2CAC (LTV to CAC ration)
+
+Only generate sub-queries that are directly relevant to the user's query and the provided business context. Do NOT go off topic or include unrelated financial concepts.
+
+Return only the sub-queries, one per line, without numbering or explanations."""
+        
         try:
             response = self.genai_client.models.generate_content(
                 model="gemini-2.5-pro",
@@ -142,27 +336,27 @@ class CFAAgent:
         self.genai_client = genai_client
         self.sub_query_generator = SubQueryGenerator(genai_client)
     
-    def analyze_with_thinking(self, query: str, context: str = "") -> Generator[Dict, None, None]:
-        """Perform deep financial analysis with live thinking display."""
-        # Start analysis
+    async def analyze_with_thinking(self, query: str, context: str = "") -> typing.AsyncGenerator[Dict, None]:
+        """Perform deep financial analysis with live thinking display as an async generator."""
+        import asyncio
         yield {"type": "thinking", "content": "🧠 **THINKING**: Starting CFA analysis..."}
+        await asyncio.sleep(0)
         logging.info("🧠 **THINKING**: Starting CFA analysis...")
-        # Generate sub-queries
         yield {"type": "thinking", "content": "🔍 **THINKING**: Generating analytical sub-queries..."}
+        await asyncio.sleep(0)
         logging.info("🔍 **THINKING**: Generating analytical sub-queries...")
         sub_queries = self.sub_query_generator.generate_sub_queries(query, context)
         if not sub_queries:
-            # Only yield fallback step if no sub-queries
             yield {"type": "thinking", "content": "⚠️ **THINKING**: Using fallback analysis approach..."}
+            await asyncio.sleep(0)
             logging.warning("⚠️ **THINKING**: Using fallback analysis approach...")
-            sub_queries = [query]  # Fallback to original query
-        # Yield header for sub-queries
+            sub_queries = [query]
         yield {"type": "thinking", "content": f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:"}
+        await asyncio.sleep(0)
         logging.info(f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:")
-        # Yield each sub-query as a separate bullet point
         for sq in sub_queries:
             yield {"type": "thinking", "content": f"• {sq}"}
-        # Collect all data (no UI yield for progress, only logging)
+            await asyncio.sleep(0)
         all_retrieved_data = []
         for i, sub_query in enumerate(sub_queries, 1):
             logging.info(f"🔍 **THINKING**: Processing sub-query {i}/{len(sub_queries)}: {sub_query}")
@@ -179,7 +373,6 @@ class CFAAgent:
                 logging.info(f"✅ **THINKING**: Retrieved {len(results)} chunks for sub-query {i}")
             except Exception as e:
                 logging.error(f"❌ **THINKING**: Error retrieving data for sub-query {i}: {str(e)}")
-        # Remove duplicates and sort by relevance
         unique_data = []
         seen_content = set()
         for data in all_retrieved_data:
@@ -198,17 +391,28 @@ class CFAAgent:
         # Prepare context from retrieved data
         context_parts = []
         for data in retrieved_data:
-            source_info = f"Source: {data['metadata'].get('source_file', 'Unknown')}, Page: {data['metadata'].get('page', 'Unknown')}"
-            context_parts.append(f"[{source_info}]\n{data['content']}\n")
+            context_parts.append(data['content'])
         
         full_context = "\n".join(context_parts)
         
         prompt = f"""You are a senior Chartered Financial Analyst (CFA) specializing in RateGain's financial performance. Provide a comprehensive financial analysis based on the data provided.
 
-BUSINESS STRUCTURE:
-- DaaS Segment: Travel BI, Hospi BI  
-- Distribution Segment: Enterprise Connectivity, Channel Manager, Uno
-- Martech Segment: BCV, MHS, Adara
+ABOUT RATEGAIN:
+RateGain is a leading travel technology company serving 7000+ customers globally across hotels, airlines, car rentals, cruise lines, and travel agencies. The company operates through three main business segments:
+
+1. **DaaS (Data-as-a-Service)**: 
+   - Travel BI: Business intelligence for travel companies
+   - Hospi BI: Business intelligence for hospitality sector
+
+2. **Distribution**: 
+   - Enterprise Connectivity: Channel management solutions
+   - Channel Manager: Distribution channel optimization
+   - Uno: Unified booking platform
+
+3. **Martech (Marketing Technology)**:
+   - BCV (Brand Compete View): Competitive intelligence
+   - MHS (Marketing Hub Solutions): Marketing automation
+   - Adara: Data-driven marketing platform
 
 CONVERSATION CONTEXT:
 {context}
@@ -225,6 +429,7 @@ ANALYSIS REQUIREMENTS:
    - Identify trends, variances, and performance drivers
    - Examine top accounts and customer dynamics
    - Review department spending patterns
+   - Emphasize NRR (Net Revenue Retention), GRR (Gross Revenue Retention), Retention, top accounts, "rule of 40", sales multiple, and LTV2CAC (LTV to CAC ratio) wherever relevant
 3. **Root Cause Analysis**: Explain the "why" behind numbers
 4. **Business Implications**: What this means for RateGain
 5. **Data-Driven Insights**: Include specific numbers, percentages, and comparisons
@@ -235,6 +440,8 @@ IMPORTANT:
 - Provide actionable business insights
 - Use professional financial analysis language
 - Include specific account names and financial figures when available
+- Do not include inline source citations
+- If relevant, discuss NRR, GRR, Retention, top accounts, "rule of 40", sales multiple, and LTV2CAC in your analysis
 
 ANALYSIS:"""
 
@@ -251,10 +458,10 @@ ANALYSIS:"""
             # Defensive check for response structure
             if response and hasattr(response, "candidates") and response.candidates and \
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
-               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts and \
-               response.candidates[0].content.parts[0] is not None and \
-               hasattr(response.candidates[0].content.parts[0], 'text') and response.candidates[0].content.parts[0].text is not None:
-                return response.candidates[0].content.parts[0].text
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+                parts = response.candidates[0].content.parts
+                answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
+                return answer
             else:
                 logging.error(f"❌ Unexpected CFA analysis response: {response}")
                 return "❌ Unable to generate analysis"
@@ -281,7 +488,42 @@ ANALYSIS:"""
         return sorted(sources, key=lambda x: x['score'])[:10]  # Top 10 sources
 
 class EnhancedRAGSystem:
-    """Enhanced RAG system with CFA agent and intelligent query routing."""
+    """Enhanced RAG system with executive agent, CFA agent and intelligent query routing."""
+    SYSTEM_PROMPT = (
+        """
+        SYSTEM INSTRUCTIONS:
+        You are LumenAI - RG Chatbot, an advanced financial analyst and executive advisor chatbot for RateGain Travel Technologies.
+        
+        ROLES:
+        - Act as a senior Chartered Financial Analyst (CFA) for deep financial analysis.
+        - Act as an executive advisor for concise, business-focused summaries.
+        - Act as a direct factual assistant for quick, accurate answers.
+        
+        FUNCTIONS & CAPABILITIES:
+        - Answer direct factual questions about RateGain's financials, segments, and products.
+        - Provide executive-level summaries with key business insights and implications.
+        - Perform deep analytical breakdowns, including root cause analysis, trends, and metric deep-dives.
+        - Generate and answer sub-queries for comprehensive analysis.
+        - Use only the provided RateGain data and context; do not use external or fabricated information.
+        - Always cite sources when possible (except in executive summaries, as instructed).
+        - Focus on key SaaS metrics: NRR, GRR, Retention, top accounts, "rule of 40", sales multiple, LTV2CAC, etc.
+        
+        DATA SOURCES:
+        - You have access to the Investor Presentation on the Un-audited (Standalone and Consolidated) Financial Results of the Company for all four quarters.
+        - This presentation contains comprehensive information about the company, its business, key updates, operating revenue, EBITDA, PAT, gross revenue retention, client count, LTV to CAC, revenue by engagement, travel type, geography, customer segments, growth metrics, highlights, achievements, product and innovation details, detailed financials (including sustained financials and profitability metrics), consolidated profit and loss, cash flow statement, industry trends, company overview, and shareholders information.
+        - Refer to the Investor Presentation whenever relevant to answer questions about the company, its business, products, metrics, or financials.
+        - If there is conflicting information from different sources, always refer to and use the latest available data.
+        
+        GUARDRAILS:
+        - Do not hallucinate on the user's question. Stay relevant to the user's question.
+        - Stick to the data provided and do not make up any data.
+        - Do NOT hallucinate or invent data.
+        - Do NOT provide investment, legal, or tax advice.
+        - Do NOT answer questions unrelated to RateGain or the provided data.
+        - If unsure or data is missing, clearly state so.
+        - Be concise, professional, and data-driven in all responses.
+        """
+    )
     
     def __init__(self, 
                  vector_store_path: str = "vector_store",
@@ -299,10 +541,12 @@ class EnhancedRAGSystem:
         self.vector_store = None
         self.genai_client = None
         self.cfa_agent = None
+        self.executive_agent = None
         self.query_classifier = QueryClassifier()
+        self.conversation_history = []  # Store full chat history as list of dicts
         
         self._setup_system()
-    
+
     def _check_vector_store_exists(self) -> bool:
         """Check if vector store exists and has data."""
         try:
@@ -328,7 +572,7 @@ class EnhancedRAGSystem:
     
     def _setup_system(self):
         """Initialize enhanced RAG system."""
-        logging.info("🚀 Initializing Enhanced RAG System with CFA Agent...")
+        logging.info("🚀 Initializing Enhanced RAG System with Executive Agent...")
         
         # Check if vector store exists
         if not self._check_vector_store_exists():
@@ -374,18 +618,31 @@ class EnhancedRAGSystem:
             logging.error(f"❌ Failed to initialize generation model: {str(e)}")
             return
         
-        # Initialize CFA agent
+        # Initialize agents
         self.cfa_agent = CFAAgent(self.vector_store, self.embeddings, self.genai_client)
-        logging.info("✅ CFA Agent initialized")
+        self.executive_agent = ExecutiveAgent(self.vector_store, self.embeddings, self.genai_client)
+        logging.info("✅ CFA Agent and Executive Agent initialized")
         
         logging.info("✅ Enhanced RAG System ready!")
-    
-    def query(self, question: str, context: str = "") -> Generator[Dict, None, None]:
-        """Process query with intelligent routing."""
+
+    def _build_context_from_history(self, history, new_user_message: str = None):
+        context_lines = []
+        for msg in history:
+            if msg["role"] in ["user", "assistant"]:
+                context_lines.append(f"{msg['role']}: {msg['content']}")
+        if new_user_message:
+            context_lines.append(f"user: {new_user_message}")
+        return "\n".join(context_lines)
+
+    async def query(self, question: str, history: list) -> typing.AsyncGenerator[dict, None]:
+        """Process query with intelligent routing as an async generator. Accepts external chat history."""
         if not self.is_ready():
             yield {"type": "error", "content": "❌ RAG system not ready"}
             return
-        
+        # Build full context from provided history
+        full_context = self._build_context_from_history(history)
+        # Prepend system prompt to context for all LLM calls
+        system_context = f"{self.SYSTEM_PROMPT}\n\n{full_context}" if full_context else self.SYSTEM_PROMPT
         # Classify query type
         query_type = self.query_classifier.classify_query(question)
         logging.info(f"📋 **PROCESSING**: Query type classified as {query_type.name}")
@@ -393,54 +650,57 @@ class EnhancedRAGSystem:
         if query_type == QueryType.DIRECT_FACTUAL:
             # Handle direct factual queries
             logging.info("📋 **PROCESSING**: Direct factual query detected")
-            
             try:
                 results = self.vector_store.similarity_search_with_score(question, k=10)
                 logging.debug(f"✅ Direct factual query: Retrieved {len(results)} chunks")
-                
-                # Prepare context
                 context_parts = []
                 sources = []
                 for doc, score in results:
-                    source_info = f"Source: {doc.metadata.get('source_file', 'Unknown')}, Page: {doc.metadata.get('page', 'Unknown')}"
-                    context_parts.append(f"[{source_info}]\n{doc.page_content}\n")
+                    context_parts.append(doc.page_content)
                     sources.append({
                         'file': doc.metadata.get('source_file', 'Unknown'),
                         'page': doc.metadata.get('page', 'Unknown'),
                         'score': score
                     })
+                full_context_data = "\n".join(context_parts)
                 
-                full_context = "\n".join(context_parts)
+                prompt = f"""{self.SYSTEM_PROMPT}\n\nYou are a financial analyst assistant for RateGain Travel Technologies. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{system_context}\n\nFINANCIAL DATA:\n{full_context_data}\n\nUSER QUESTION: {question}\n\nProvide a direct, accurate answer with specific numbers. Be concise but complete. Do not include inline source citations."""
                 
-                # Generate direct answer
-                prompt = f"""You are a financial analyst assistant. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{context}\n\nFINANCIAL DATA:\n{full_context}\n\nUSER QUESTION: {question}\n\nProvide a direct, accurate answer with specific numbers and source references. Be concise but complete."""
                 response = self.genai_client.models.generate_content(
                     model=self.generation_model,
                     contents=prompt,
                     config={'temperature': 0.1, 'max_output_tokens': 10000}
                 )
-                # Defensive check for response structure
                 if response and hasattr(response, "candidates") and response.candidates and \
                    hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
-                   hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts and \
-                   response.candidates[0].content.parts[0] is not None and \
-                   hasattr(response.candidates[0].content.parts[0], 'text') and response.candidates[0].content.parts[0].text is not None:
-                    answer = response.candidates[0].content.parts[0].text
+                   hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+                    parts = response.candidates[0].content.parts
+                    answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
                     logging.info("✅ Direct factual query: Answer generated successfully")
                     yield {"type": "answer", "content": answer, "sources": sources[:5]}
                 else:
                     logging.error(f"❌ Direct factual query: Unexpected response: {response}")
+                    if hasattr(response.candidates[0], "content"):
+                        logging.error(f"❌ candidates[0].content: {response.candidates[0].content}")
                     yield {"type": "error", "content": "❌ Unable to generate response"}
-                
             except Exception as e:
                 logging.error(f"❌ Error processing direct factual query: {str(e)}")
                 yield {"type": "error", "content": f"❌ Error processing query: {str(e)}"}
         
-        else:  # ANALYTICAL query
-            logging.info("🧠 **PROCESSING**: Analytical query detected - routing to CFA Agent")
-            
+        elif query_type == QueryType.EXECUTIVE_ANALYTICAL:
+            # Use executive agent for concise analytical insights
+            logging.info("🎯 **PROCESSING**: Executive analytical query detected")
+            async for item in self.executive_agent.analyze_executive_summary(question, system_context):
+                if item["type"] == "answer":
+                    yield item
+            self.query_classifier.add_to_history(question, 'executive_analytical')
+        
+        else:  # DEEP_ANALYTICAL
             # Use CFA agent for deep analysis
-            yield from self.cfa_agent.analyze_with_thinking(question, context)
+            logging.info("🧠 **PROCESSING**: Deep analytical query detected - routing to CFA Agent")
+            async for item in self.cfa_agent.analyze_with_thinking(question, system_context):
+                yield item
+            self.query_classifier.add_to_history(question, 'deep_analytical')
     
     def is_ready(self) -> bool:
         """Check if the enhanced RAG system is ready."""
@@ -448,7 +708,8 @@ class EnhancedRAGSystem:
             self.embeddings is not None,
             self.vector_store is not None,
             self.genai_client is not None,
-            self.cfa_agent is not None
+            self.cfa_agent is not None,
+            self.executive_agent is not None
         ])
 
 # Alias for compatibility
@@ -465,7 +726,8 @@ def main():
     # Test queries
     test_queries = [
         "What was the GAAP revenue for Hospi BI in August 2024?",  # Direct
-        "Compare the EBITDA for Hospi BI and Travel BI in Q2 and Q3, analyze why there has been any increase or decrease"  # Analytical
+        "Compare the EBITDA for Hospi BI and Travel BI in Q2 and Q3",  # Executive
+        "Analyze further the EBITDA trends for Hospi BI"  # Deep (follow-up)
     ]
     
     logging.info("\n🧪 Testing Enhanced RAG System...")
@@ -474,19 +736,24 @@ def main():
         logging.info(f"QUERY: {query}")
         logging.info('='*50)
         
-        for response in rag_system.query(query):
-            if response["type"] == "thinking":
-                logging.info(response["content"])
-            elif response["type"] == "answer":
-                logging.info(f"\n📝 FINAL ANSWER:")
-                logging.info(response["content"])
-                if response.get("sources"):
-                    logging.info(f"\n📚 SOURCES:")
-                    for source in response["sources"]:
-                        logging.info(f"- {source['file']}, Page: {source['page']} (Score: {source['score']:.4f})")
-            elif response["type"] == "error":
-                logging.error(response["content"])
-        
+        # Use regular for loop since main() is not async
+        import asyncio
+        async def run_query():
+            # Create a dummy history for testing
+            dummy_history = [{"role": "user", "content": "Hello, I'm a user."}]
+            async for response in rag_system.query(query, dummy_history):
+                if response["type"] == "thinking":
+                    logging.info(response["content"])
+                elif response["type"] == "answer":
+                    logging.info(f"\n📝 FINAL ANSWER:")
+                    logging.info(response["content"])
+                    if response.get("sources"):
+                        logging.info(f"\n📚 SOURCES:")
+                        for source in response["sources"]:
+                            logging.info(f"- {source['file']}, Page: {source['page']} (Score: {source['score']:.4f})")
+                elif response["type"] == "error":
+                    logging.error(response["content"])
+        asyncio.run(run_query())
         time.sleep(2)
 
 if __name__ == "__main__":

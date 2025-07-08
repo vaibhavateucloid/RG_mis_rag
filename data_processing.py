@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from google import genai
 from chromadb.api import ClientAPI
 
+import hashlib
+
 # Load environment variables
 load_dotenv()
 
@@ -32,7 +34,7 @@ class Config:
     
     # Page-based chunking parameters
     PAGE_OVERLAP_CHARS = 800  # Characters to overlap between pages
-    MAX_CHUNK_SIZE = 4000     # Maximum chunk size
+    MAX_CHUNK_SIZE = 4500     # Maximum chunk size
     
     # Embedding model
     EMBEDDING_MODELS = ["gemini-embedding-exp-03-07"]
@@ -187,6 +189,10 @@ def create_page_based_chunks(documents: List[Document],
     
     return all_chunks
 
+def compute_chunk_hash(text: str) -> str:
+    """Compute a SHA256 hash for the given text to use as a unique chunk ID."""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
 class GeminiEmbeddings:
     """Custom embeddings class that uses Google Gemini embedding models."""
     
@@ -262,7 +268,7 @@ def create_vector_store(chunks: List[Document],
                         embedding_model_name: str,
                         persist_directory: str,
                         collection_name: str) -> Chroma:
-    """Generate embeddings and store in ChromaDB."""
+    """Generate embeddings and store in ChromaDB, with caching to avoid re-embedding existing chunks. Deduplicate chunks by content hash."""
     if not chunks:
         print("⚠️ No chunks to embed")
         return None
@@ -274,54 +280,85 @@ def create_vector_store(chunks: List[Document],
         embeddings = GeminiEmbeddings(embedding_model_name)
         print("🔄 Generating embeddings and storing in vector database...")
         
-        # Extract texts from chunks
-        texts_from_chunks = [chunk.page_content for chunk in chunks]
-        
-        # Generate embeddings
-        generated_embeddings = embeddings.embed_documents(texts_from_chunks)
-        
-        # Prepare data for ChromaDB
-        documents_to_add = []
-        metadatas_to_add = []
-        ids_to_add = []
-        embeddings_to_add = []
-        
-        for i, embedding in enumerate(generated_embeddings):
-            if embedding:
-                chunk = chunks[i]
-                documents_to_add.append(chunk.page_content)
-                metadatas_to_add.append(chunk.metadata)
-                
-                # Generate unique ID
-                source_file = chunk.metadata.get('source_file', 'unknown_file')
-                chunk_id = chunk.metadata.get('chunk_id', i)
-                chunk_type = chunk.metadata.get('chunk_type', 'regular')
-                unique_id = f"{source_file}_{chunk_type}_{chunk_id}"
-                ids_to_add.append(unique_id)
-                embeddings_to_add.append(embedding)
-            else:
-                print(f"⚠️ Skipping chunk {i} due to failed embedding")
-        
-        if not documents_to_add:
-            print("❌ No successful embeddings generated")
-            return None
-        
         # Initialize ChromaDB client
         client = chromadb.PersistentClient(path=persist_directory)
         
-        # Create collection
+        # Create or get collection
         collection = client.get_or_create_collection(
             name=collection_name,
             embedding_function=None
         )
         
-        # Add documents
-        collection.add(
-            documents=documents_to_add,
-            embeddings=embeddings_to_add,
-            metadatas=metadatas_to_add,
-            ids=ids_to_add
-        )
+        # Get existing IDs in the collection (cached chunks)
+        existing_ids = set()
+        try:
+            count = collection.count()
+            if count > 0:
+                batch_size = 500
+                for offset in range(0, count, batch_size):
+                    results = collection.get(ids=None, limit=batch_size, offset=offset)
+                    if 'ids' in results:
+                        existing_ids.update(results['ids'])
+        except Exception as e:
+            print(f"⚠️ Could not fetch existing IDs from collection: {str(e)}")
+        
+        # Deduplicate chunks by content hash
+        unique_chunks = {}
+        for i, chunk in enumerate(chunks):
+            chunk_hash = compute_chunk_hash(chunk.page_content)
+            if chunk_hash not in unique_chunks:
+                unique_chunks[chunk_hash] = (i, chunk)
+            else:
+                print(f"⏩ Duplicate chunk detected (hash: {chunk_hash}), skipping duplicate.")
+        
+        # Prepare data for new chunks only
+        documents_to_add = []
+        metadatas_to_add = []
+        ids_to_add = []
+        embeddings_to_add = []
+        texts_to_embed = []
+        chunk_indices_to_embed = []
+        
+        for chunk_hash, (i, chunk) in unique_chunks.items():
+            unique_id = chunk_hash
+            if unique_id not in existing_ids:
+                texts_to_embed.append(chunk.page_content)
+                chunk_indices_to_embed.append(i)
+                ids_to_add.append(unique_id)
+                documents_to_add.append(chunk.page_content)
+                metadatas_to_add.append({**chunk.metadata, 'chunk_hash': chunk_hash})
+            else:
+                print(f"⏩ Skipping chunk {i} (already embedded, hash: {unique_id})")
+        
+        # Generate embeddings for new chunks only
+        if texts_to_embed:
+            generated_embeddings = embeddings.embed_documents(texts_to_embed)
+            for idx, embedding in enumerate(generated_embeddings):
+                if embedding:
+                    embeddings_to_add.append(embedding)
+                else:
+                    print(f"⚠️ Skipping chunk {chunk_indices_to_embed[idx]} due to failed embedding")
+                    documents_to_add[idx] = None
+                    metadatas_to_add[idx] = None
+                    ids_to_add[idx] = None
+            documents_to_add = [d for d in documents_to_add if d is not None]
+            metadatas_to_add = [m for m in metadatas_to_add if m is not None]
+            ids_to_add = [i for i in ids_to_add if i is not None]
+            embeddings_to_add = [e for e in embeddings_to_add if e]
+        else:
+            print("✅ All chunks already embedded. No new embeddings needed.")
+        
+        # Add new documents to collection
+        if documents_to_add and embeddings_to_add:
+            collection.add(
+                documents=documents_to_add,
+                embeddings=embeddings_to_add,
+                metadatas=metadatas_to_add,
+                ids=ids_to_add
+            )
+            print(f"✅ Added {len(documents_to_add)} new chunks to vector store.")
+        else:
+            print("ℹ️ No new chunks added to vector store.")
         
         # Create LangChain Chroma object
         vector_store = Chroma(
@@ -333,7 +370,7 @@ def create_vector_store(chunks: List[Document],
         print(f"✅ Vector store created successfully!")
         print(f"   📍 Location: {persist_directory}")
         print(f"   📦 Collection: {collection_name}")
-        print(f"   📄 Total chunks stored: {len(documents_to_add)}")
+        print(f"   📄 Total chunks stored: {collection.count()}")
         
         return vector_store
         

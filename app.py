@@ -4,6 +4,7 @@ import streamlit as st
 from rag_main import RAGSystem  # Using the enhanced RAG system
 import time
 import logging
+import asyncio
 
 # Set page configuration
 st.set_page_config(page_title="LumenAI RG Chat",
@@ -160,63 +161,52 @@ def main():
             # Create a placeholder for thinking steps
             thinking_placeholder = thinking_container.empty()
             spinner_placeholder = None
-            # Process query with live thinking display
-            for response in rag.query(enhanced_question, conversation_context):
-                if response["type"] == "thinking":
-                    thinking_steps.append(response["content"])
-                    # Update thinking display in real-time with collapsible container
-                    with thinking_placeholder.container():
-                        with st.expander("🧠 **Live Thinking Process**", expanded=True):
-                            subquery_end_idx = None
-                            for idx, step in enumerate(thinking_steps):
-                                display_thinking_step(step)
-                                # Detect the last sub-query bullet point
-                                if step.startswith("• "):
-                                    subquery_end_idx = idx
-                            # Show spinner after the last sub-query bullet point
-                            if subquery_end_idx is not None and len(thinking_steps) == subquery_end_idx + 1:
-                                spinner_placeholder = st.empty()
-                                with spinner_placeholder.container():
-                                    st.info("⏳ Analyzing and generating answer...")
-                            else:
-                                if spinner_placeholder:
-                                    spinner_placeholder.empty()
-                
-                elif response["type"] == "answer":
-                    final_answer = response["content"]
-                    final_sources = response.get("sources", [])
-                    
-                    # Collapse the thinking process and show final answer
-                    with thinking_placeholder.container():
-                        with st.expander("🧠 **Thinking Process**", expanded=False):
-                            for step in thinking_steps:
-                                display_thinking_step(step)
-                    
-                    if spinner_placeholder:
-                        spinner_placeholder.empty()
-                    
-                    answer_container.markdown(final_answer)
-                    
-                    # Show sources
-                    if final_sources:
-                        with sources_container.expander("📚 Sources"):
-                            for i, source in enumerate(final_sources, 1):
-                                st.markdown(f"**{i}.** {source['file']}, Page: {source['page']} (Relevance: {source['score']:.4f})")
-                
-                elif response["type"] == "error":
-                    # Clear thinking and show error
-                    if spinner_placeholder:
-                        spinner_placeholder.empty()
-                    thinking_placeholder.empty()
-                    answer_container.error(response["content"])
-                    final_answer = response["content"]
-                    logging.error(f"Error response from RAG system: {response['content']}")
             
+            async def run_query():
+                nonlocal final_answer, final_sources, spinner_placeholder
+                async for response in rag.query(enhanced_question, st.session_state.messages):
+                    if response["type"] == "thinking":
+                        thinking_steps.append(response["content"])
+                        # Update thinking display in real-time with collapsible container
+                        with thinking_placeholder.container():
+                            with st.expander("🧠 **Live Thinking Process**", expanded=True):
+                                subquery_end_idx = None
+                                for idx, step in enumerate(thinking_steps):
+                                    display_thinking_step(step)
+                                    # Detect the last sub-query bullet point
+                                    if step.startswith("• "):
+                                        subquery_end_idx = idx
+                                # Show spinner after the last sub-query bullet point
+                                if subquery_end_idx is not None and len(thinking_steps) == subquery_end_idx + 1:
+                                    spinner_placeholder = st.empty()
+                                    with spinner_placeholder.container():
+                                        st.markdown("⏳ Thinking...")
+                    elif response["type"] == "answer":
+                        final_answer = response["content"]
+                        final_sources = response.get("sources", [])
+                        # Collapse the thinking process and show final answer
+                        with thinking_placeholder.container():
+                            with st.expander("🧠 **Thinking Process**", expanded=False):
+                                for step in thinking_steps:
+                                    display_thinking_step(step)
+                        answer_container.markdown(final_answer)
+                        # Show sources
+                        if final_sources:
+                            with sources_container.expander("📚 Sources"):
+                                for src in final_sources:
+                                    st.markdown(f"- {src}")
+                    elif response["type"] == "error":
+                        # Clear thinking and show error
+                        if spinner_placeholder:
+                            spinner_placeholder.empty()
+                        final_answer = response["content"]
+                        logging.error(f"Error response from RAG system: {response['content']}")
+            asyncio.run(run_query())
             # Add assistant response to chat history with thinking steps
             assistant_message = {
                 "role": "assistant", 
                 "content": final_answer,
-                "thinking_steps": thinking_steps,
+                "thinking": thinking_steps,
                 "sources": final_sources
             }
             st.session_state.messages.append(assistant_message)
