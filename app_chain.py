@@ -394,7 +394,8 @@
 # Enhanced Chainlit App with Real-Time Collapsible Thinking Display
 
 import chainlit as cl
-from rag_adapter import AsyncRAGAdapter # Using the async adapter for RAG system
+#from rag_adapter import AsyncRAGAdapter # Using the async adapter for RAG system
+from rag_main import EnhancedRAGSystem
 import logging
 import asyncio
 
@@ -408,7 +409,7 @@ def initialize_rag():
     """Initialize the RAG system."""
     global rag_system
     if rag_system is None:
-        rag_system = AsyncRAGAdapter()
+        rag_system = EnhancedRAGSystem()
     return rag_system
 
 def format_thinking_content(step_content):
@@ -455,8 +456,8 @@ async def start():
     # Store RAG system in session
     cl.user_session.set("rag", rag)
     
-    # Initialize conversation context
-    cl.user_session.set("conversation_context", "")
+    # Initialize chat history as a list of dicts
+    cl.user_session.set("chat_history", [])
     
     # Check system status
     if rag.is_ready():
@@ -486,7 +487,7 @@ async def retrieve_sources(sources):
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Main message handler with real-time thinking stream."""
+    """Main message handler with real-time thinking stream and live animation."""
     logging.info(f"User submitted question: {message.content}")
     
     # Get RAG system from session
@@ -495,28 +496,52 @@ async def main(message: cl.Message):
         await cl.Message(content="❌ System not initialized. Please refresh the page.").send()
         return
     
-    # Get conversation context
-    conversation_context = cl.user_session.get("conversation_context", "")
+    # Get chat history (list of dicts)
+    chat_history = cl.user_session.get("chat_history", [])
+    logging.info(f"Current chat_history: {chat_history}")
     
-    # Update conversation context
-    conversation_context += f"user: {message.content}\n"
+    # Append user message to chat history
+    chat_history.append({"role": "user", "content": message.content})
+    logging.info(f"Appended user message. Updated chat_history: {chat_history}")
     
-    # Enhanced question with context for follow-ups
-    enhanced_question = f"Previous conversation:\n{conversation_context}\nCurrent question: {message.content}" if len(conversation_context) > 50 else message.content
+    # Enhanced question with context for follow-ups (for display, not for backend)
+    enhanced_question = message.content
+    logging.info(f"Passing to rag.query: enhanced_question={enhanced_question}, chat_history={chat_history}")
     
     # Variables to track the process
     final_answer = ""
     final_sources = []
     thinking_content = ""
     step_count = 0
+    animation_frames = ["⏳", "⏳.", "⏳..", "⏳...", "⏳....", "⏳....."]
+    animation_idx = 0
+    animation_running = True
     
     # Create a single step for the entire thinking process
     async with cl.Step(name="🧠 Live Analysis Process", type="llm", show_input=False) as thinking_step:
         thinking_step.input = f"Analyzing: {message.content}"
         
+        async def animate():
+            nonlocal animation_idx, animation_running, thinking_content, step_count
+            while animation_running:
+                dots = animation_frames[animation_idx % len(animation_frames)]
+                if thinking_content:
+                    thinking_step.output = f"{thinking_content}\n\n{dots} <span style='color:gray'>(Live analysis in progress)</span>\n\n**Steps processed: {step_count}**"
+                else:
+                    thinking_step.output = f"{dots} <span style='color:gray'>(Live analysis in progress)</span>"
+                animation_idx += 1
+                await asyncio.sleep(0.4)
+        # Start animation in the background
+        animation_task = asyncio.create_task(animate())
         try:
+            # Log the type and repr of the object returned by rag.query
+            query_result = rag.query(enhanced_question, chat_history)
+            logging.info(f"rag.query returned object of type: {type(query_result)}, repr: {repr(query_result)}")
+            
             # Process query with real-time thinking display
-            async for response in rag.query(enhanced_question, conversation_context):
+            logging.info("About to enter async for loop over rag.query result...")
+            async for response in query_result:
+                logging.info(f"Received response from rag.query: {response}")
                 if response["type"] == "thinking":
                     step_count += 1
                     formatted_thinking = format_thinking_content(response["content"])
@@ -526,9 +551,7 @@ async def main(message: cl.Message):
                         thinking_content += f"\n\n---\n\n{formatted_thinking}"
                     else:
                         thinking_content = formatted_thinking
-                    
-                    # Update the step output in real-time
-                    thinking_step.output = f"{thinking_content}\n\n**Steps processed: {step_count}**"
+                    # The animation task will update the output
                     
                     # Small delay for better UX
                     await asyncio.sleep(0.05)
@@ -537,10 +560,12 @@ async def main(message: cl.Message):
                     final_answer = response["content"]
                     final_sources = response.get("sources", [])
                     
-                    # Update conversation context
-                    conversation_context += f"assistant: {final_answer}\n"
-                    cl.user_session.set("conversation_context", conversation_context)
+                    # Append assistant response to chat history
+                    chat_history.append({"role": "assistant", "content": final_answer})
+                    cl.user_session.set("chat_history", chat_history)
                     
+                    animation_running = False
+                    await animation_task
                     # Set final step output
                     thinking_step.output = f"{thinking_content}\n\n✅ **Analysis Complete!** ({step_count} steps processed)"
                     
@@ -550,14 +575,18 @@ async def main(message: cl.Message):
                     error_msg = response["content"]
                     logging.error(f"Error response from RAG system: {error_msg}")
                     
+                    animation_running = False
+                    await animation_task
                     # Update step with error
                     thinking_step.output = f"{thinking_content}\n\n❌ **Error occurred**: {error_msg}"
                     
                     # Send error message
                     await cl.Message(content=f"❌ **Error**: {error_msg}").send()
                     return
-                    
+            logging.info("Exited async for loop over rag.query result.")
         except Exception as e:
+            animation_running = False
+            await animation_task
             error_msg = f"An error occurred: {str(e)}"
             logging.error(f"Exception in main: {error_msg}")
             
