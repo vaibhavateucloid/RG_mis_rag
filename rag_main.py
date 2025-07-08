@@ -86,8 +86,9 @@ class GeminiEmbeddings:
 class QueryClassifier:
     """Classifies queries as direct factual, executive analytical, or deep analytical."""
     
-    def __init__(self):
+    def __init__(self, genai_client=None):
         self.conversation_history = deque(maxlen=5)  # Track last 5 turns
+        self.genai_client = genai_client
     
     def add_to_history(self, query: str, response_type: str):
         """Add query and response type to conversation history."""
@@ -98,53 +99,74 @@ class QueryClassifier:
         })
     
     def classify_query(self, query: str) -> QueryType:
-        """Classify the query type based on intent and conversation context."""
+        """Classify the query type using Gemini-2.5-Flash if available, else fallback to keyword logic."""
         query_lower = query.lower()
-        
+        # Try LLM-based classification if client is available
+        if self.genai_client is not None:
+            try:
+                prompt = f"""
+You are an expert assistant. Classify the following user query into one of three categories:
+- direct_factual: The user is asking for specific numbers, facts, or metrics (e.g., 'What was the revenue in Q2?').
+- executive_analytical: The user wants a high-level summary, comparison, or business insight (e.g., 'Summarize the performance of Hospi BI in Q2').
+- deep_analytical: The user wants a detailed, root-cause, or multi-step analysis (e.g., 'Analyze the EBITDA trends and explain the drivers').
+
+User query: {query}
+
+Respond with only one of: direct_factual, executive_analytical, deep_analytical. Do not explain.
+"""
+                response = self.genai_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config={
+                        'temperature': 0.0,
+                        'max_output_tokens': 10
+                    }
+                )
+                if response and hasattr(response, "candidates") and response.candidates and \
+                   hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+                   hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+                    label = response.candidates[0].content.parts[0].text.strip().lower()
+                    if label == "direct_factual":
+                        return QueryType.DIRECT_FACTUAL
+                    elif label == "executive_analytical":
+                        return QueryType.EXECUTIVE_ANALYTICAL
+                    elif label == "deep_analytical":
+                        return QueryType.DEEP_ANALYTICAL
+            except Exception as e:
+                logging.warning(f"[QueryClassifier] LLM classification failed, falling back to keyword logic: {e}")
+        # Fallback: keyword-based logic
         # Check for deep analysis triggers
         deep_analysis_keywords = [
             'detailed analysis', 'deep dive', 'comprehensive analysis', 'elaborate',
             'explain why', 'root cause', 'analyze further', 'tell me more',
             'breakdown', 'deep analysis', 'thorough analysis', 'in-depth',
-            'detailed breakdown', 'comprehensive breakdown', 'full analysis'
+            'detailed breakdown', 'comprehensive breakdown', 'full analysis', 'drivers', 'why did', 'explain the reason'
         ]
-        
-        # Check for follow-up indicators in context
         followup_phrases = [
             'elaborate', 'details', 'more about', 'explain this', 'why',
-            'how', 'what caused', 'dive deeper', 'expand on'
+            'how', 'what caused', 'dive deeper', 'expand on', 'root cause', 'drivers'
         ]
-        
-        # Check if this is a follow-up to previous executive summary
         if self.conversation_history:
             last_response = self.conversation_history[-1]
             if (last_response['response_type'] == 'executive_analytical' and
                 any(phrase in query_lower for phrase in followup_phrases)):
                 return QueryType.DEEP_ANALYTICAL
-        
-        # Check for explicit deep analysis requests
         if any(keyword in query_lower for keyword in deep_analysis_keywords):
             return QueryType.DEEP_ANALYTICAL
-        
-        # Check for analytical intent (executive level)
         analytical_keywords = [
             'compare', 'analyze', 'analyse', 'trend', 'growth', 'decline',
             'increase', 'decrease', 'performance', 'vs', 'versus', 'difference', 
-            'impact', 'correlation', 'relationship', 'factor', 'driver'
+            'impact', 'correlation', 'relationship', 'factor', 'driver', 'summary', 'summarize', 'overview', 'insight', 'high level'
         ]
-        
         if any(keyword in query_lower for keyword in analytical_keywords):
             return QueryType.EXECUTIVE_ANALYTICAL
-        
-        # Check for multiple segments/products mentioned (likely comparative)
         segments = ['daas', 'distribution', 'martech']
         products = ['travel bi', 'hospi bi', 'enterprise connectivity', 'channel manager', 
                    'uno', 'bcv', 'mhs', 'adara']
-        
         mentioned_count = sum(1 for item in segments + products if item in query_lower)
         if mentioned_count > 1:
             return QueryType.EXECUTIVE_ANALYTICAL
-        
+        # Default: direct factual
         return QueryType.DIRECT_FACTUAL
 
 class ExecutiveAgent:
@@ -621,6 +643,9 @@ class EnhancedRAGSystem:
         # Initialize agents
         self.cfa_agent = CFAAgent(self.vector_store, self.embeddings, self.genai_client)
         self.executive_agent = ExecutiveAgent(self.vector_store, self.embeddings, self.genai_client)
+        self.query_classifier = QueryClassifier(genai_client=self.genai_client)
+        self.conversation_history = []  # Store full chat history as list of dicts
+        
         logging.info("✅ CFA Agent and Executive Agent initialized")
         
         logging.info("✅ Enhanced RAG System ready!")
@@ -636,23 +661,25 @@ class EnhancedRAGSystem:
 
     async def query(self, question: str, history: list) -> typing.AsyncGenerator[dict, None]:
         """Process query with intelligent routing as an async generator. Accepts external chat history."""
+        logging.debug(f"[RAG] query() called with question: {question!r}, history type: {type(history)}, history: {history}")
         if not self.is_ready():
+            logging.error("[RAG] System not ready, yielding error.")
             yield {"type": "error", "content": "❌ RAG system not ready"}
             return
         # Build full context from provided history
         full_context = self._build_context_from_history(history)
+        logging.debug(f"[RAG] Built full_context: {full_context!r}")
         # Prepend system prompt to context for all LLM calls
         system_context = f"{self.SYSTEM_PROMPT}\n\n{full_context}" if full_context else self.SYSTEM_PROMPT
         # Classify query type
         query_type = self.query_classifier.classify_query(question)
-        logging.info(f"📋 **PROCESSING**: Query type classified as {query_type.name}")
+        logging.info(f"[RAG] Query type classified as {query_type.name}")
         
         if query_type == QueryType.DIRECT_FACTUAL:
-            # Handle direct factual queries
-            logging.info("📋 **PROCESSING**: Direct factual query detected")
+            logging.debug("[RAG] Processing direct factual query")
             try:
                 results = self.vector_store.similarity_search_with_score(question, k=10)
-                logging.debug(f"✅ Direct factual query: Retrieved {len(results)} chunks")
+                logging.debug(f"[RAG] Direct factual query: Retrieved {len(results)} chunks")
                 context_parts = []
                 sources = []
                 for doc, score in results:
@@ -676,31 +703,32 @@ class EnhancedRAGSystem:
                    hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                     parts = response.candidates[0].content.parts
                     answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
-                    logging.info("✅ Direct factual query: Answer generated successfully")
+                    logging.debug("[RAG] Direct factual query: Answer generated successfully, yielding answer.")
                     yield {"type": "answer", "content": answer, "sources": sources[:5]}
                 else:
-                    logging.error(f"❌ Direct factual query: Unexpected response: {response}")
+                    logging.error(f"[RAG] Direct factual query: Unexpected response: {response}")
                     if hasattr(response.candidates[0], "content"):
-                        logging.error(f"❌ candidates[0].content: {response.candidates[0].content}")
+                        logging.debug(f"[RAG] candidates[0].content: {response.candidates[0].content}")
                     yield {"type": "error", "content": "❌ Unable to generate response"}
             except Exception as e:
-                logging.error(f"❌ Error processing direct factual query: {str(e)}")
+                logging.error(f"[RAG] Error processing direct factual query: {str(e)}")
                 yield {"type": "error", "content": f"❌ Error processing query: {str(e)}"}
         
         elif query_type == QueryType.EXECUTIVE_ANALYTICAL:
-            # Use executive agent for concise analytical insights
-            logging.info("🎯 **PROCESSING**: Executive analytical query detected")
+            logging.debug("[RAG] Processing executive analytical query")
             async for item in self.executive_agent.analyze_executive_summary(question, system_context):
+                logging.debug(f"[RAG] Yielding executive agent item: {item}")
                 if item["type"] == "answer":
                     yield item
             self.query_classifier.add_to_history(question, 'executive_analytical')
         
         else:  # DEEP_ANALYTICAL
-            # Use CFA agent for deep analysis
-            logging.info("🧠 **PROCESSING**: Deep analytical query detected - routing to CFA Agent")
+            logging.debug("[RAG] Processing deep analytical query - routing to CFA Agent")
             async for item in self.cfa_agent.analyze_with_thinking(question, system_context):
+                logging.debug(f"[RAG] Yielding CFA agent item: {item}")
                 yield item
             self.query_classifier.add_to_history(question, 'deep_analytical')
+        logging.debug("[RAG] query() exiting.")
     
     def is_ready(self) -> bool:
         """Check if the enhanced RAG system is ready."""
