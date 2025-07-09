@@ -543,6 +543,7 @@ class EnhancedRAGSystem:
         - Use only the provided RateGain data and context; do not use external or fabricated information.
         - Always cite sources when possible (except in executive summaries, as instructed).
         - Focus on key SaaS metrics: NRR, GRR, Retention, top accounts, "rule of 40", sales multiple, LTV2CAC, etc.
+        - Always try to give an answer.
         
         DATA SOURCES:
         - You have access to the Investor Presentation on the Un-audited (Standalone and Consolidated) Financial Results of the Company for all four quarters.

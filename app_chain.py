@@ -55,6 +55,19 @@ async def start():
     """Initialize the chat session."""
     logging.info("Chat session started.")
    
+    # Show usage instructions on first access
+    await cl.Message(
+        content=(
+            "⚠️ **Notice:** This is an under-development app.\n\n"
+            "- Please report any errors immediately.\n"
+            "- Refresh the app periodically.\n"
+            "- For best results, open a new chat after every 4-5 messages.\n"
+            "- If you see a wrong response or an error in displaying the message, refresh the page.\n"
+            "\nThank you for helping us improve!"
+        ),
+        author="System"
+    ).send()
+
     # Initialize RAG system
     rag = initialize_rag()
    
