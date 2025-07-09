@@ -99,7 +99,7 @@ class QueryClassifier:
         })
     
     def classify_query(self, query: str) -> QueryType:
-        """Classify the query type using Gemini-2.5-Flash if available, else fallback to keyword logic."""
+        """Classify the query type using Gemini-2.5-Flash if available, else fallback to robust keyword logic."""
         query_lower = query.lower()
         # Try LLM-based classification if client is available
         if self.genai_client is not None:
@@ -107,8 +107,8 @@ class QueryClassifier:
                 prompt = f"""
 You are an expert assistant. Classify the following user query into one of three categories:
 - direct_factual: The user is asking for specific numbers, facts, or metrics (e.g., 'What was the revenue in Q2?').
-- executive_analytical: The user wants a high-level summary, comparison, or business insight (e.g., 'Summarize the performance of Hospi BI in Q2').
-- deep_analytical: The user wants a detailed, root-cause, or multi-step analysis (e.g., 'Analyze the EBITDA trends and explain the drivers').
+- executive_analytical: The user wants a high-level summary, overview, comparison, or business insight (e.g., 'Summarize the performance of Hospi BI in Q2', 'Overview of...', 'Compare X and Y').
+- deep_analytical: The user wants a detailed, root-cause, or multi-step analysis (e.g., 'Analyze the EBITDA trends and explain the drivers', 'Why did revenue drop?').
 
 User query: {query}
 
@@ -134,40 +134,39 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
                         return QueryType.DEEP_ANALYTICAL
             except Exception as e:
                 logging.warning(f"[QueryClassifier] LLM classification failed, falling back to keyword logic: {e}")
-        # Fallback: keyword-based logic
-        # Check for deep analysis triggers
+        # Fallback: robust keyword-based logic
+        # 1. Deep Analytical: root cause, why, drivers, analysis, etc.
         deep_analysis_keywords = [
-            'detailed analysis', 'deep dive', 'comprehensive analysis', 'elaborate',
-            'explain why', 'root cause', 'analyze further', 'tell me more',
-            'breakdown', 'deep analysis', 'thorough analysis', 'in-depth',
-            'detailed breakdown', 'comprehensive breakdown', 'full analysis', 'drivers', 'why did', 'explain the reason'
+            'root cause', 'why', 'explain', 'driver', 'reason', 'cause', 'deep analysis', 'detailed analysis',
+            'elaborate', 'breakdown', 'comprehensive analysis', 'in-depth', 'thorough', 'analyze', 'analyse',
+            'further analysis', 'drill down', 'expand on', 'dive deeper', 'what caused', 'explain the reason', 'drivers'
         ]
-        followup_phrases = [
-            'elaborate', 'details', 'more about', 'explain this', 'why',
-            'how', 'what caused', 'dive deeper', 'expand on', 'root cause', 'drivers'
-        ]
-        if self.conversation_history:
-            last_response = self.conversation_history[-1]
-            if (last_response['response_type'] == 'executive_analytical' and
-                any(phrase in query_lower for phrase in followup_phrases)):
-                return QueryType.DEEP_ANALYTICAL
-        if any(keyword in query_lower for keyword in deep_analysis_keywords):
+        if any(kw in query_lower for kw in deep_analysis_keywords):
             return QueryType.DEEP_ANALYTICAL
-        analytical_keywords = [
-            'compare', 'analyze', 'analyse', 'trend', 'growth', 'decline',
-            'increase', 'decrease', 'performance', 'vs', 'versus', 'difference', 
-            'impact', 'correlation', 'relationship', 'factor', 'driver', 'summary', 'summarize', 'overview', 'insight', 'high level'
+        # 2. Executive Analytical: summary, overview, compare, trend, performance, insight, high level, etc.
+        executive_keywords = [
+            'summary', 'summarize', 'overview', 'insight', 'compare', 'comparison', 'trend', 'performance',
+            'high level', 'business impact', 'implication', 'implications', 'key findings', 'key insights',
+            'business insight', 'business overview', 'business summary', 'business review', 'review', 'synthesis',
+            'recap', 'conclusion', 'conclude', 'highlight', 'main points', 'main findings', 'main insights', 'synthesize'
         ]
-        if any(keyword in query_lower for keyword in analytical_keywords):
+        if any(kw in query_lower for kw in executive_keywords):
             return QueryType.EXECUTIVE_ANALYTICAL
-        segments = ['daas', 'distribution', 'martech']
-        products = ['travel bi', 'hospi bi', 'enterprise connectivity', 'channel manager', 
-                   'uno', 'bcv', 'mhs', 'adara']
-        mentioned_count = sum(1 for item in segments + products if item in query_lower)
-        if mentioned_count > 1:
-            return QueryType.EXECUTIVE_ANALYTICAL
-        # Default: direct factual
-        return QueryType.DIRECT_FACTUAL
+        # 3. Direct Factual: must contain metric/number keywords and NOT contain summary/analysis words
+        metric_keywords = [
+            'revenue', 'ebitda', 'cost', 'costs', 'profit', 'loss', 'nrr', 'grr', 'retention', 'monetization',
+            'department spending', 'sales', 'ltv', 'cogs', 'cashflow', 'cash flow', 'collection', 'accounts',
+            'account', 'customer', 'customers', 'number of', 'amount', 'total', 'value', 'figure', 'metric', 'data',
+            'percentage', 'percent', 'ratio', 'score', 'count', 'average', 'mean', 'median', 'variance', 'change',
+            'increase', 'decrease', 'drop', 'rise', 'growth', 'decline', 'month', 'quarter', 'year', 'period', 'date',
+            'as of', 'for', 'in', 'during', 'between', 'show', 'list', 'give', 'provide', 'display', 'report', 'state',
+            'what is', 'what was', 'how many', 'how much', 'when', 'which', 'find', 'identify', 'fetch', 'extract'
+        ]
+        # Exclude if summary/analysis words present
+        if any(kw in query_lower for kw in metric_keywords) and not any(kw in query_lower for kw in executive_keywords + deep_analysis_keywords):
+            return QueryType.DIRECT_FACTUAL
+        # Default: executive analytical (catch-all for high-level)
+        return QueryType.EXECUTIVE_ANALYTICAL
 
 class ExecutiveAgent:
     """Executive-level analytical agent for concise, comprehensive insights."""
@@ -238,12 +237,20 @@ FINANCIAL DATA:
 
 USER QUERY: {query}
 
+IMPORTANT:
+- Only use information present in the provided sources.
+- Do not make up or infer data that is not explicitly present.
+- Your summary must be concise but highly insightful.
+- Surface hidden, non-obvious, or counterintuitive insights that a typical reader might overlook.
+- Highlight patterns, anomalies, or trends that are not immediately apparent.
+
 EXECUTIVE SUMMARY REQUIREMENTS:
 - Length: 200-300 words maximum
 - Format: Use bullet points for key insights
 - Use tables for comparative analysis when comparing multiple items
 - Include specific metrics and percentages
 - Focus on business impact and actionable insights
+- Highlight at least one insight that is not obvious or is counterintuitive
 - No inline source citations
 - Structure: Brief overview, key insights (3-5 bullet points), business implications
 
@@ -255,6 +262,7 @@ RESPONSE FORMAT:
 • [Key finding 1 with specific metrics]
 • [Key finding 2 with trend analysis]
 • [Key finding 3 with business impact]
+• [Non-obvious or hidden insight]
 
 ## Business Implications
 [Brief strategic implications]
@@ -276,6 +284,7 @@ ANALYSIS:"""
             )
             
             if response and hasattr(response, "candidates") and response.candidates and \
+               response.candidates[0] is not None and \
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 parts = response.candidates[0].content.parts
@@ -483,6 +492,7 @@ ANALYSIS:"""
             )
             # Defensive check for response structure
             if response and hasattr(response, "candidates") and response.candidates and \
+               response.candidates[0] is not None and \
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 parts = response.candidates[0].content.parts
@@ -572,7 +582,7 @@ class EnhancedRAGSystem:
         self.conversation_history = []  # Store full chat history as list of dicts
         
         self._setup_system()
-
+    
     def _check_vector_store_exists(self) -> bool:
         """Check if vector store exists and has data."""
         try:
@@ -654,12 +664,12 @@ class EnhancedRAGSystem:
         
         logging.info("✅ Enhanced RAG System ready!")
 
-    def _build_context_from_history(self, history, new_user_message: str = None):
+    def _build_context_from_history(self, history, new_user_message: Optional[str] = None):
         context_lines = []
         for msg in history:
             if msg["role"] in ["user", "assistant"]:
                 context_lines.append(f"{msg['role']}: {msg['content']}")
-        if new_user_message:
+        if isinstance(new_user_message, str) and new_user_message.strip():
             context_lines.append(f"user: {new_user_message}")
         return "\n".join(context_lines)
 
@@ -682,6 +692,15 @@ class EnhancedRAGSystem:
         if query_type == QueryType.DIRECT_FACTUAL:
             logging.debug("[RAG] Processing direct factual query")
             try:
+                # Yield custom thinking steps for direct factual
+                yield {"type": "thinking", "content": "📊 **Direct Factual Query Mode**"}
+                yield {"type": "thinking", "content": "🔎 **Fetching data...**"}
+                if self.vector_store is None:
+                    yield {"type": "error", "content": "❌ Vector store is not initialized."}
+                    return
+                if self.genai_client is None:
+                    yield {"type": "error", "content": "❌ Gemini client is not initialized."}
+                    return
                 results = self.vector_store.similarity_search_with_score(question, k=10)
                 logging.debug(f"[RAG] Direct factual query: Retrieved {len(results)} chunks")
                 context_parts = []
@@ -695,23 +714,27 @@ class EnhancedRAGSystem:
                     })
                 full_context_data = "\n".join(context_parts)
                 
-                prompt = f"""{self.SYSTEM_PROMPT}\n\nYou are a financial analyst assistant for RateGain Travel Technologies. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{system_context}\n\nFINANCIAL DATA:\n{full_context_data}\n\nUSER QUESTION: {question}\n\nProvide a direct, accurate answer with specific numbers. Be concise but complete. Do not include inline source citations."""
+                prompt = f"""{self.SYSTEM_PROMPT}\n\nYou are a financial analyst assistant for RateGain Travel Technologies. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{system_context}\n\nFINANCIAL DATA:\n{full_context_data}\n\nUSER QUESTION: {question}\n\nIMPORTANT:\n- Only use information present in the provided sources.\n- Do not make up or infer data that is not explicitly present.\n- Provide a direct, accurate answer with specific numbers. Be concise but complete.\n- Do not include inline source citations."""
                 
                 response = self.genai_client.models.generate_content(
                     model=self.generation_model,
                     contents=prompt,
                     config={'temperature': 0.1, 'max_output_tokens': 10000}
                 )
+                # Yield data fetched and ready steps before answer
+                yield {"type": "thinking", "content": "✅ **Data fetched!** (step 1/1)"}
+                yield {"type": "thinking", "content": "📤 **Ready to share the data**"}
                 if response and hasattr(response, "candidates") and response.candidates and \
+                   response.candidates[0] is not None and \
                    hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                    hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                     parts = response.candidates[0].content.parts
-                    answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
+                    answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text is not None])
                     logging.debug("[RAG] Direct factual query: Answer generated successfully, yielding answer.")
                     yield {"type": "answer", "content": answer, "sources": sources[:5]}
                 else:
                     logging.error(f"[RAG] Direct factual query: Unexpected response: {response}")
-                    if hasattr(response.candidates[0], "content"):
+                    if response and hasattr(response, "candidates") and response.candidates and response.candidates[0] is not None and hasattr(response.candidates[0], "content"):
                         logging.debug(f"[RAG] candidates[0].content: {response.candidates[0].content}")
                     yield {"type": "error", "content": "❌ Unable to generate response"}
             except Exception as e:
@@ -720,14 +743,25 @@ class EnhancedRAGSystem:
         
         elif query_type == QueryType.EXECUTIVE_ANALYTICAL:
             logging.debug("[RAG] Processing executive analytical query")
+            # Yield custom thinking steps for executive analytical
+            yield {"type": "thinking", "content": "📈 **Executive Analytical Query Mode**"}
+            yield {"type": "thinking", "content": "🔎 **Compiling executive summary...**"}
+            if self.executive_agent is None:
+                yield {"type": "error", "content": "❌ Executive agent is not initialized."}
+                return
             async for item in self.executive_agent.analyze_executive_summary(question, system_context):
                 logging.debug(f"[RAG] Yielding executive agent item: {item}")
                 if item["type"] == "answer":
+                    yield {"type": "thinking", "content": "✅ **Summary compiled!** (step 1/1)"}
+                    yield {"type": "thinking", "content": "📤 **Ready to share executive insights**"}
                     yield item
             self.query_classifier.add_to_history(question, 'executive_analytical')
         
         else:  # DEEP_ANALYTICAL
             logging.debug("[RAG] Processing deep analytical query - routing to CFA Agent")
+            if self.cfa_agent is None:
+                yield {"type": "error", "content": "❌ CFA agent is not initialized."}
+                return
             async for item in self.cfa_agent.analyze_with_thinking(question, system_context):
                 logging.debug(f"[RAG] Yielding CFA agent item: {item}")
                 yield item
