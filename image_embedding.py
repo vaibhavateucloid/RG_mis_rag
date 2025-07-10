@@ -24,6 +24,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -32,10 +33,12 @@ print("✅ All imports successful!")
 
 class Config:
     # Paths
-    PDF_DIR = "sample_doc"
-    VECTOR_DB_DIR = "vector_store"
+    PDF_DIR = "Documents"  # Root folder containing both MIS and IP + Transcript
+    MIS_DIR = os.path.join(PDF_DIR, "MIS")
+    IP_DIR = os.path.join(PDF_DIR, "IP + Transcript")
+    VECTOR_DB_DIR = "data_vector_store"
     MODELS_DIR = "models"
-    IMAGES_DIR = "extracted_images_all"  # New: directory for extracted images
+    IMAGES_DIR = "extracted_images"  # Directory for extracted images
     
     # Page-based chunking parameters
     PAGE_OVERLAP_CHARS = 800  # Characters to overlap between pages
@@ -50,7 +53,7 @@ class Config:
     EMBEDDING_MODELS = ["gemini-embedding-exp-03-07"]
     
     # Gemini Vision model
-    VISION_MODEL = "gemini-2.5-pro"  # Updated to use latest vision model
+    VISION_MODEL = "gemini-2.5-flash"  # Updated to use latest vision model
     
     # Vector store
     COLLECTION_NAME = "pdf_documents"
@@ -59,11 +62,15 @@ config = Config()
 
 # Create directories if they don't exist
 os.makedirs(config.PDF_DIR, exist_ok=True)
+os.makedirs(config.MIS_DIR, exist_ok=True)
+os.makedirs(config.IP_DIR, exist_ok=True)
 os.makedirs(config.VECTOR_DB_DIR, exist_ok=True)
 os.makedirs(config.MODELS_DIR, exist_ok=True)
 os.makedirs(config.IMAGES_DIR, exist_ok=True)
 
 print(f"📁 PDF Directory: {config.PDF_DIR}")
+print(f"📁 MIS Directory: {config.MIS_DIR}")
+print(f"📁 IP + Transcript Directory: {config.IP_DIR}")
 print(f"🗄️ Vector Store Directory: {config.VECTOR_DB_DIR}")
 print(f"🖼️ Images Directory: {config.IMAGES_DIR}")
 print(f"🤖 Models Directory: {config.MODELS_DIR}")
@@ -128,8 +135,8 @@ def extract_images_from_pdf(pdf_path: str) -> List[Dict]:
                     # Create PIL Image
                     image = Image.open(io.BytesIO(image_bytes))
                     
-                    # Filter out very small images (likely icons, bullets, etc.)
-                    if image.size[0] < config.MIN_IMAGE_SIZE[0] or image.size[1] < config.MIN_IMAGE_SIZE[1]:
+                    # Filter out images with width < 500 or height < 150
+                    if image.size[0] < 500 or image.size[1] < 150:
                         continue
                     
                     # Resize if too large
@@ -317,23 +324,25 @@ def create_page_based_chunks(documents: List[Document],
     return all_chunks
 
 def create_image_chunks(pdf_files: List[str], gemini_client) -> List[Document]:
-    """Create chunks from extracted images using Gemini Vision analysis."""
+    """Create chunks from extracted images using Gemini Vision analysis, combined with all text from the same page."""
     print(f"🖼️ Processing images from {len(pdf_files)} PDF files...")
-    
     all_image_chunks = []
     chunk_id = 0
     total_images = 0
-    
     for pdf_path in pdf_files:
         # Extract images from PDF
         images_data = extract_images_from_pdf(pdf_path)
         total_images += len(images_data)
-        
         if not images_data:
             continue
-        
+        # Load all page texts for this PDF (using PyPDFLoader)
+        try:
+            loader = PyPDFLoader(pdf_path)
+            pdf_docs = loader.load()
+        except Exception as e:
+            print(f"   ❌ Error loading PDF for page text extraction: {str(e)}")
+            pdf_docs = []
         print(f"🔍 Analyzing {len(images_data)} images from {os.path.basename(pdf_path)}...")
-        
         for img_data in images_data:
             try:
                 # Analyze image with Gemini Vision
@@ -343,27 +352,32 @@ def create_image_chunks(pdf_files: List[str], gemini_client) -> List[Document]:
                     gemini_client, 
                     img_data
                 )
-                
-                # Create comprehensive image chunk content
-                chunk_content = f"""[IMAGE ANALYSIS - {img_data['source_file']}]
+                # Get full text for the same page
+                page_text = ""
+                page_num = img_data['page_num']
+                if pdf_docs and 0 <= page_num < len(pdf_docs):
+                    page_text = pdf_docs[page_num].page_content
+                # Combine image analysis and page text
+                chunk_content = f"""[IMAGE + PAGE CONTEXT - {img_data['source_file']}]
 
 Image Location: Page {img_data['page_num']}, Image {img_data['img_index']}
 Image Size: {img_data['size'][0]}x{img_data['size'][1]} pixels
 Image File: {img_data['image_filename']}
 
+--- IMAGE ANALYSIS ---
 {image_description}
 
----
-This content was extracted from an image using AI vision analysis. The image is located on page {img_data['page_num']} of {img_data['source_file']}.
-"""
-                
-                # Create image chunk
+--- PAGE TEXT ---
+{page_text}
+
+---\nThis chunk combines the image analysis and all text from the same page for richer context."""
+                # Create combined chunk
                 image_chunk = Document(
                     page_content=chunk_content,
                     metadata={
                         'chunk_id': chunk_id,
-                        'chunk_type': 'image_analysis',
-                        'content_type': 'image',
+                        'chunk_type': 'image_plus_page',
+                        'content_type': 'image+text',
                         'source_file': img_data['source_file'],
                         'page': img_data['page_num'],
                         'page_start': img_data['page_num'],
@@ -371,30 +385,26 @@ This content was extracted from an image using AI vision analysis. The image is 
                         'img_index': img_data['img_index'],
                         'image_path': img_data['image_path'],
                         'image_filename': img_data['image_filename'],
-                        'image_size': img_data['size'],
+                        'image_width': img_data['size'][0],
+                        'image_height': img_data['size'][1],
                         'chunk_size': len(chunk_content),
-                        'bbox': img_data['bbox']
+                        'bbox': str(img_data['bbox']) if img_data['bbox'] is not None else None
                     }
                 )
-                
                 all_image_chunks.append(image_chunk)
                 chunk_id += 1
-                
-                # Small delay to avoid rate limiting
                 time.sleep(0.5)
-                
             except Exception as e:
                 print(f"   ❌ Error processing image {img_data['img_index']} on page {img_data['page_num']}: {str(e)}")
                 continue
-    
-    print(f"✅ Created {len(all_image_chunks)} image chunks from {total_images} images")
+    print(f"✅ Created {len(all_image_chunks)} image+page-context chunks from {total_images} images")
     return all_image_chunks
 
 def compute_chunk_hash(text: str) -> str:
     """Compute a SHA256 hash for the given text to use as a unique chunk ID."""
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
-class GeminiEmbeddings:
+class GeminiEmbeddings(Embeddings):
     """Custom embeddings class that uses Google Gemini embedding models."""
     
     def __init__(self, model_name: str):
@@ -468,7 +478,7 @@ class GeminiEmbeddings:
 def create_vector_store(chunks: List[Document],
                         embedding_model_name: str,
                         persist_directory: str,
-                        collection_name: str) -> Chroma:
+                        collection_name: str) -> Optional[Chroma]:
     """Generate embeddings and store in ChromaDB, with caching to avoid re-embedding existing chunks. Deduplicate chunks by content hash."""
     if not chunks:
         print("⚠️ No chunks to embed")
@@ -583,13 +593,12 @@ def create_vector_store(chunks: List[Document],
         print(f"❌ Error creating vector store: {str(e)}")
         return None
 
-def test_vector_store(vector_store: Chroma, test_queries: List[str] = None, k: int = 10):
+def test_vector_store(vector_store: Optional[Chroma], test_queries: Optional[List[str]] = None, k: int = 10):
     """Test the vector store with sample queries including image-related ones."""
     if vector_store is None:
         print("⚠️ Vector store not available for testing")
         return
-    
-    if test_queries is None:
+    if not test_queries:
         test_queries = [
             "fastest growing demand booster growth percentage",
             "revenue growth charts and trends",
@@ -597,14 +606,11 @@ def test_vector_store(vector_store: Chroma, test_queries: List[str] = None, k: i
             "employee headcount data",
             "financial performance charts"
         ]
-    
     for query in test_queries:
         print(f"\n🔍 Testing query: '{query}'")
         print(f"📊 Retrieving top {k} similar chunks...")
-        
         try:
             results = vector_store.similarity_search_with_score(query, k=k)
-            
             print(f"\n📋 Search Results for '{query}':")
             for i, (doc, score) in enumerate(results[:5], 1):  # Show top 5
                 chunk_type = doc.metadata.get('chunk_type', 'unknown')
@@ -613,22 +619,18 @@ def test_vector_store(vector_store: Chroma, test_queries: List[str] = None, k: i
                 page_info = f"Page: {doc.metadata.get('page_start', 'Unknown')}"
                 if doc.metadata.get('page_end') != doc.metadata.get('page_start'):
                     page_info += f"-{doc.metadata.get('page_end', 'Unknown')}"
-                
                 print(f"\n--- Result {i} (Score: {score:.4f}) ---")
                 print(f"Source: {doc.metadata.get('source_file', 'Unknown')}")
                 print(f"{page_info} | Type: {chunk_type} | Content: {content_type} | Overlap: {is_overlap}")
-                
                 if content_type == 'image':
                     print(f"Image: {doc.metadata.get('image_filename', 'Unknown')}")
-                
                 print(f"Content: {doc.page_content[:300]}...")
-                
         except Exception as e:
             print(f"❌ Error during testing query '{query}': {str(e)}")
 
 def load_existing_vector_store(persist_directory: str,
                                embedding_model_name: str,
-                               collection_name: str) -> Chroma:
+                               collection_name: str) -> Optional[Chroma]:
     """Load an existing vector store from disk."""
     print(f"📁 Loading existing vector store from: {persist_directory}")
     
@@ -730,23 +732,28 @@ def main():
         print(f"❌ Error initializing Gemini Vision client: {str(e)}")
         return None, None, None, None
     
-    # Load documents
-    documents = load_pdf_documents(config.PDF_DIR)
-    
-    # Create text chunks (your existing logic)
+    # Gather all PDFs for text chunking (MIS + IP)
+    mis_pdfs = glob.glob(os.path.join(config.MIS_DIR, "*.pdf"))
+    ip_pdfs = glob.glob(os.path.join(config.IP_DIR, "*.pdf"))
+    all_pdfs = mis_pdfs + ip_pdfs
+    print(f"📚 Found {len(all_pdfs)} PDF files for text chunking.")
+    # Load documents from each directory only once
+    documents = []
+    if mis_pdfs:
+        documents.extend(load_pdf_documents(config.MIS_DIR))
+    if ip_pdfs:
+        documents.extend(load_pdf_documents(config.IP_DIR))
+    # Create text chunks (all PDFs)
     text_chunks = create_page_based_chunks(
         documents, 
         overlap_chars=config.PAGE_OVERLAP_CHARS,
         max_chunk_size=config.MAX_CHUNK_SIZE
     )
-    
-    # Create image chunks (new functionality)
-    pdf_files = glob.glob(os.path.join(config.PDF_DIR, "*.pdf"))
-    image_chunks = create_image_chunks(pdf_files, gemini_vision_client)
-    
-    # Combine all chunks
+    # Only extract images from MIS PDFs
+    print(f"🖼️ Extracting images only from MIS PDFs...")
+    image_chunks = create_image_chunks(mis_pdfs, gemini_vision_client)
+    # Combine all text and image chunks
     all_chunks = text_chunks + image_chunks
-    
     # Create vector store with both text and image chunks
     vector_store = create_vector_store(
         chunks=all_chunks,

@@ -563,7 +563,7 @@ class EnhancedRAGSystem:
     )
     
     def __init__(self, 
-                 vector_store_path: str = "vector_store",
+                 vector_store_path: str = "data_vector_store",
                  collection_name: str = "pdf_documents",
                  embedding_model: str = "gemini-embedding-exp-03-07",
                  generation_model: str = "gemini-2.5-pro"):

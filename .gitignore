@@ -16,3 +16,5 @@ venv
 # Data
 data/vector_store/
 vector_store
+data_vector_store
+Documents
