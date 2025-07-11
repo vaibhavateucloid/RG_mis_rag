@@ -14,3 +14,6 @@ streamlit>=1.46.1
 openpyxl
 pandas
 openai
+pymupdf
+pillow
+numpy

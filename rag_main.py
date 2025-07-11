@@ -22,7 +22,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # Import data processing pipeline
-from data_processing import main as run_data_processing, load_existing_vector_store, Config
+from image_embedding import main as run_data_processing, load_existing_vector_store, Config
 
 class QueryType(Enum):
     DIRECT_FACTUAL = "direct_factual"
@@ -171,10 +171,11 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
 class ExecutiveAgent:
     """Executive-level analytical agent for concise, comprehensive insights."""
     
-    def __init__(self, vector_store, embeddings, genai_client):
+    def __init__(self, vector_store, embeddings, genai_client, llm_fallback_fn):
         self.vector_store = vector_store
         self.embeddings = embeddings
         self.genai_client = genai_client
+        self._call_llm_with_fallback = llm_fallback_fn
     
     async def analyze_executive_summary(self, query: str, context: str = "") -> typing.AsyncGenerator[Dict, None]:
         """Perform executive-level analysis with concise insights."""
@@ -273,7 +274,7 @@ RESPONSE FORMAT:
 ANALYSIS:"""
 
         try:
-            response = self.genai_client.models.generate_content(
+            response = self._call_llm_with_fallback(
                 model="gemini-2.5-pro",
                 contents=prompt,
                 config={
@@ -282,18 +283,20 @@ ANALYSIS:"""
                     'max_output_tokens': 8000,
                 }
             )
-            
             if response and hasattr(response, "candidates") and response.candidates and \
                response.candidates[0] is not None and \
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 parts = response.candidates[0].content.parts
-                answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
-                return answer
+                answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
+                if answer.strip():
+                    return answer
+                else:
+                    logging.warning(f"LLM returned no answer text. Full response: {response}")
+                    return "❌ No answer could be generated for this query."
             else:
                 logging.error(f"❌ Unexpected executive analysis response: {response}")
                 return "❌ Unable to generate executive summary"
-                
         except Exception as e:
             logging.error(f"❌ Error generating executive analysis: {str(e)}")
             return "❌ Error generating executive summary"
@@ -301,8 +304,9 @@ ANALYSIS:"""
 class SubQueryGenerator:
     """Generates sub-queries for CFA deep analysis."""
     
-    def __init__(self, genai_client):
+    def __init__(self, genai_client, llm_fallback_fn):
         self.genai_client = genai_client
+        self._call_llm_with_fallback = llm_fallback_fn
     
     def generate_sub_queries(self, original_query: str, context: str = "") -> List[str]:
         """Generate sub-queries for deep financial analysis."""
@@ -347,27 +351,32 @@ Only generate sub-queries that are directly relevant to the user's query and the
 Return only the sub-queries, one per line, without numbering or explanations."""
         
         try:
-            response = self.genai_client.models.generate_content(
+            response = self._call_llm_with_fallback(
                 model="gemini-2.5-pro",
                 contents=prompt,
-                config={'temperature': 0.3, 'max_output_tokens': 10000}
+                config={'temperature': 0.4, 'max_output_tokens': 10000}
             )
-            if response and response.candidates and len(response.candidates) > 0:
+            if response and hasattr(response, "candidates") and response.candidates and \
+               response.candidates[0] is not None and \
+               hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 sub_queries_text = response.candidates[0].content.parts[0].text
                 sub_queries = [q.strip() for q in sub_queries_text.split('\n') if q.strip()]
                 return sub_queries[:8]  # Limit to 8 sub-queries
+            return []
         except Exception as e:
             logging.error(f"Error generating sub-queries: {e}")
-        return []
+            return []
 
 class CFAAgent:
     """Chartered Financial Analyst agent for deep financial analysis."""
     
-    def __init__(self, vector_store, embeddings, genai_client):
+    def __init__(self, vector_store, embeddings, genai_client, llm_fallback_fn):
         self.vector_store = vector_store
         self.embeddings = embeddings
         self.genai_client = genai_client
-        self.sub_query_generator = SubQueryGenerator(genai_client)
+        self._call_llm_with_fallback = llm_fallback_fn
+        self.sub_query_generator = SubQueryGenerator(genai_client, llm_fallback_fn)
     
     async def analyze_with_thinking(self, query: str, context: str = "") -> typing.AsyncGenerator[Dict, None]:
         """Perform deep financial analysis with live thinking display as an async generator."""
@@ -481,7 +490,7 @@ IMPORTANT:
 ANALYSIS:"""
 
         try:
-            response = self.genai_client.models.generate_content(
+            response = self._call_llm_with_fallback(
                 model="gemini-2.5-pro",
                 contents=prompt,
                 config={
@@ -490,18 +499,20 @@ ANALYSIS:"""
                     'max_output_tokens': 20000,
                 }
             )
-            # Defensive check for response structure
             if response and hasattr(response, "candidates") and response.candidates and \
                response.candidates[0] is not None and \
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
-               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+               hasattr(response.candidates[0], "content") and response.candidates[0].content.parts:
                 parts = response.candidates[0].content.parts
-                answer = ''.join([p.text for p in parts if hasattr(p, 'text')])
-                return answer
+                answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
+                if answer.strip():
+                    return answer
+                else:
+                    logging.warning(f"LLM returned no answer text. Full response: {response}")
+                    return "❌ No answer could be generated for this query."
             else:
                 logging.error(f"❌ Unexpected CFA analysis response: {response}")
                 return "❌ Unable to generate analysis"
-                
         except Exception as e:
             logging.error(f"❌ Error generating analysis: {str(e)}")
             return "❌ Error generating analysis"
@@ -647,17 +658,34 @@ class EnhancedRAGSystem:
         # Initialize generation client
         try:
             api_key = os.environ.get("GOOGLE_API_KEY")
+            api_key_secondary = os.environ.get("GOOGLE_API_KEY_SECONDARY")
+            self.genai_client_primary = None
+            self.genai_client_secondary = None
             if not api_key:
                 raise ValueError("GOOGLE_API_KEY environment variable not set.")
-            self.genai_client = genai.Client(api_key=api_key)
-            logging.info(f"✅ Generation model initialized: {self.generation_model}")
+            try:
+                self.genai_client_primary = genai.Client(api_key=api_key)
+                logging.info(f"✅ Generation model initialized: {self.generation_model} (primary key)")
+            except Exception as e:
+                logging.error(f"❌ Failed to initialize generation model with primary key: {str(e)}")
+            if api_key_secondary:
+                try:
+                    self.genai_client_secondary = genai.Client(api_key=api_key_secondary)
+                    logging.info(f"✅ Generation model initialized: {self.generation_model} (secondary key)")
+                except Exception as e2:
+                    logging.error(f"❌ Failed to initialize generation model with secondary key: {str(e2)}")
+            # Use primary as default for compatibility
+            self.genai_client = self.genai_client_primary or self.genai_client_secondary
+            if not self.genai_client:
+                logging.error("❌ No valid Gemini client could be initialized.")
+                return
         except Exception as e:
             logging.error(f"❌ Failed to initialize generation model: {str(e)}")
             return
         
         # Initialize agents
-        self.cfa_agent = CFAAgent(self.vector_store, self.embeddings, self.genai_client)
-        self.executive_agent = ExecutiveAgent(self.vector_store, self.embeddings, self.genai_client)
+        self.cfa_agent = CFAAgent(self.vector_store, self.embeddings, self.genai_client, self._call_llm_with_fallback)
+        self.executive_agent = ExecutiveAgent(self.vector_store, self.embeddings, self.genai_client, self._call_llm_with_fallback)
         self.query_classifier = QueryClassifier(genai_client=self.genai_client)
         self.conversation_history = []  # Store full chat history as list of dicts
         
@@ -717,11 +745,16 @@ class EnhancedRAGSystem:
                 
                 prompt = f"""{self.SYSTEM_PROMPT}\n\nYou are a financial analyst assistant for RateGain Travel Technologies. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{system_context}\n\nFINANCIAL DATA:\n{full_context_data}\n\nUSER QUESTION: {question}\n\nIMPORTANT:\n- Only use information present in the provided sources.\n- Do not make up or infer data that is not explicitly present.\n- Provide a direct, accurate answer with specific numbers. Be concise but complete.\n- Do not include inline source citations."""
                 
-                response = self.genai_client.models.generate_content(
-                    model=self.generation_model,
-                    contents=prompt,
-                    config={'temperature': 0.1, 'max_output_tokens': 10000}
-                )
+                try:
+                    response = self._call_llm_with_fallback(
+                        model=self.generation_model,
+                        contents=prompt,
+                        config={'temperature': 0.1, 'max_output_tokens': 10000}
+                    )
+                except Exception as e:
+                    logging.error(f"Error generating direct factual answer (both keys failed): {e}")
+                    yield {"type": "error", "content": f"❌ Error processing query: {str(e)}"}
+                    return
                 # Yield data fetched and ready steps before answer
                 yield {"type": "thinking", "content": "✅ **Data fetched!** (step 1/1)"}
                 yield {"type": "thinking", "content": "📤 **Ready to share the data**"}
@@ -730,9 +763,13 @@ class EnhancedRAGSystem:
                    hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                    hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                     parts = response.candidates[0].content.parts
-                    answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text is not None])
-                    logging.debug("[RAG] Direct factual query: Answer generated successfully, yielding answer.")
-                    yield {"type": "answer", "content": answer, "sources": sources[:5]}
+                    answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
+                    if answer.strip():
+                        logging.debug("[RAG] Direct factual query: Answer generated successfully, yielding answer.")
+                        yield {"type": "answer", "content": answer, "sources": sources[:5]}
+                    else:
+                        logging.warning(f"LLM returned no answer text. Full response: {response}")
+                        yield {"type": "error", "content": "❌ Unable to generate response"}
                 else:
                     logging.error(f"[RAG] Direct factual query: Unexpected response: {response}")
                     if response and hasattr(response, "candidates") and response.candidates and response.candidates[0] is not None and hasattr(response.candidates[0], "content"):
@@ -778,6 +815,52 @@ class EnhancedRAGSystem:
             self.cfa_agent is not None,
             self.executive_agent is not None
         ])
+
+    # Utility function for robust LLM call with per-request fallback
+    def _call_llm_with_fallback(self, model, contents, config):
+        """Try primary Gemini client, fallback to secondary if needed, including on None/empty answer. Log all key/model switches and empty answers."""
+        error_types = ["503", "429", "401", "UNAVAILABLE", "overload", "quota", "rate limit"]
+        def extract_answer(response):
+            if response and hasattr(response, "candidates") and response.candidates and \
+               response.candidates[0] is not None and \
+               hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+                parts = response.candidates[0].content.parts
+                answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
+                return answer.strip(), response
+            return None, response
+        # Try all (key, model) combinations: (primary, pro), (primary, flash), (secondary, pro), (secondary, flash)
+        tried = []
+        for key_name, client in [("primary", self.genai_client_primary), ("secondary", self.genai_client_secondary)]:
+            if not client:
+                continue
+            for model_name in [model, "gemini-2.5-flash" if model != "gemini-2.5-flash" else None]:
+                if not model_name:
+                    continue
+                try:
+                    log_msg = f"Trying Gemini {model_name} with {key_name} key."
+                    logging.info(log_msg)
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config
+                    )
+                    answer, resp_obj = extract_answer(response)
+                    if answer:
+                        logging.info(f"Gemini {model_name} with {key_name} key succeeded.")
+                        return response
+                    else:
+                        logging.warning(f"Gemini {model_name} with {key_name} key returned None/empty answer. Full response: {resp_obj}")
+                        tried.append((key_name, model_name, "empty"))
+                except Exception as e:
+                    if any(err in str(e).upper() for err in error_types):
+                        logging.warning(f"Gemini {model_name} with {key_name} key failed ({e}), trying next fallback...")
+                        tried.append((key_name, model_name, f"exception: {e}"))
+                    else:
+                        logging.error(f"Gemini {model_name} with {key_name} key error: {e}")
+                        raise
+        logging.error(f"All Gemini key/model combinations failed or returned empty. Tried: {tried}")
+        raise RuntimeError(f"No valid Gemini client/model available for LLM call, or all returned empty/None answer. Tried: {tried}")
 
 # Alias for compatibility
 RAGSystem = EnhancedRAGSystem
