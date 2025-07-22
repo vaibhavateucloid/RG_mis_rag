@@ -592,6 +592,7 @@ class EnhancedRAGSystem:
         - Always be precise about the time period of the data you use. If a user asks for a specific month, use that month's data. If unavailable, state so clearly.
 
         GRANULARITY & ANALYSIS:
+        - For overall analysis and Quarter wise data for entire Rategain refer to the investor presentations and earnings call transcripts.
         - Always answer at the most granular level possible: segment, product, sub-product, region, account, month, etc.
         - Use all available data, including visuals and tables, for your analysis.
         - If a user asks for a metric, search all relevant sections and documents before stating data is unavailable.

@@ -105,7 +105,7 @@ async def retrieve_sources(sources):
  
 @cl.on_message
 async def main(message: cl.Message):
-    """Main message handler with immediate message sending."""
+    """Main message handler with collapsible real-time thinking display."""
     logging.info(f"User submitted question: {message.content}")
    
     # Get RAG system from session
@@ -151,7 +151,7 @@ async def main(message: cl.Message):
                     thinking_step = cl.Step(
                         name=f"🧠 Live Analysis Process (Click to expand)",
                         type="tool",
-                        show_input=False
+                        show_input=False  # This makes it collapsible and closed by default
                     )
                     await thinking_step.__aenter__()
                     thinking_step.input = "🔄 Starting deep CFA analysis..."
@@ -167,7 +167,7 @@ async def main(message: cl.Message):
                 new_content = f"{formatted_thinking}\n\n---\n\n"
                 for char in new_content:
                     await thinking_step.stream_token(char)
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.01)  # Small delay for streaming effect
                
                 # Update step name to show progress
                 thinking_step.name = f"🧠 Live Analysis Process ({step_count} steps) - Click to expand"
@@ -177,48 +177,33 @@ async def main(message: cl.Message):
                 final_answer = response["content"]
                 final_sources = response.get("sources", [])
                
-                # ⚡ SEND MESSAGE IMMEDIATELY - NO DELAYS
-                logging.info("🚀 DEBUG: Sending message IMMEDIATELY to prevent session timeout")
-                
-                # Check session is still active
-                try:
-                    session_id = cl.user_session.get("id", "unknown")
-                    logging.info(f"🔍 DEBUG: Session still active: {session_id}")
-                except Exception as e:
-                    logging.error(f"❌ DEBUG: Session access error: {e}")
-                
-                # Send final answer FIRST, before any other operations
-                try:
-                    await cl.Message(content=final_answer).send()
-                    logging.info("✅ DEBUG: Final message sent IMMEDIATELY")
-                except Exception as e:
-                    logging.error(f"❌ DEBUG: Immediate message send failed: {e}")
-               
-                # Complete the thinking step AFTER message is sent
+                # Complete the thinking step
                 if thinking_step and is_cfa_analysis:
-                    thinking_step.output = f"{accumulated_thinking}✅ **Analysis Complete!** ({step_count} steps processed)\n\n🎯 **Comprehensive answer provided**"
+                    thinking_step.output = f"{accumulated_thinking}✅ **Analysis Complete!** ({step_count} steps processed)\n\n🎯 **Ready to provide comprehensive answer**"
                     thinking_step.name = f"🧠 Analysis Complete ({step_count} steps) - Click to expand"
                     await thinking_step.update()
+                    await thinking_step.__aexit__(None, None, None)
                
                 # Append assistant response to chat history
                 chat_history.append({"role": "assistant", "content": final_answer})
                 cl.user_session.set("chat_history", chat_history)
                
-                logging.info(f"Assistant response generated and sent immediately")
-                break
+                logging.info(f"Assistant response generated: {final_answer}")
+                break  # Exit the loop once we get the answer
                
             elif response["type"] == "error":
                 error_msg = response["content"]
                 logging.error(f"Error response from RAG system: {error_msg}")
                
-                # Send error immediately
-                await cl.Message(content=f"❌ **Error**: {error_msg}").send()
-               
+                # Update thinking step with error if it exists
                 if thinking_step:
                     thinking_step.output = f"{accumulated_thinking}❌ **Error occurred**: {error_msg}"
                     thinking_step.name = f"🧠 Analysis Error - Click to expand"
                     await thinking_step.update()
+                    await thinking_step.__aexit__(None, None, None)
                
+                # Send error message and return
+                await cl.Message(content=f"❌ **Error**: {error_msg}").send()
                 return
        
         logging.info("Exited async for loop over rag.query result.")
@@ -227,28 +212,42 @@ async def main(message: cl.Message):
         error_msg = f"An error occurred: {str(e)}"
         logging.error(f"Exception in main: {error_msg}")
        
-        # Send error immediately
-        await cl.Message(content=f"❌ **Error**: {error_msg}").send()
-        
+        # Update thinking step with exception if it exists
         if thinking_step:
             thinking_step.output = f"{accumulated_thinking}❌ **Exception occurred**: {error_msg}"
             thinking_step.name = f"🧠 Analysis Exception - Click to expand"
             await thinking_step.update()
+            await thinking_step.__aexit__(None, None, None)
        
+        # Send error message and return
+        await cl.Message(content=f"❌ **Error**: {error_msg}").send()
         return
    
-    # Send sources AFTER main message (if session still active)
-    if final_sources:
+    # Add delay before sending final answer
+    await asyncio.sleep(0.3)
+   
+    # Send the final answer
+    if final_answer:
         try:
-            await asyncio.sleep(0.2)  # Small delay only for sources
-            async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
-                sources_text = await retrieve_sources(final_sources)
-                sources_step.output = f"**Retrieved {len(final_sources)} sources:**\n\n{sources_text}"
-                logging.info("✅ DEBUG: Sources sent after main message")
+            # Create the final answer message
+            await cl.Message(content=final_answer).send()
+            logging.info("Final message sent successfully to UI")
+           
+            # Add delay before sources
+            await asyncio.sleep(0.2)
+           
+            # Send sources as a separate collapsible step if available
+            if final_sources:
+                async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
+                    sources_text = await retrieve_sources(final_sources)
+                    sources_step.output = f"**Retrieved {len(final_sources)} sources:**\n\n{sources_text}"
+                   
         except Exception as e:
-            logging.error(f"❌ DEBUG: Sources failed (session may have ended): {e}")
-    
-    logging.info("🔍 DEBUG: Main function execution completed")
+            logging.error(f"Error sending final message: {e}")
+            await cl.Message(content=f"❌ Error displaying results: {str(e)}").send()
+    else:
+        logging.warning("No final answer to send")
+        await cl.Message(content="❌ No response generated").send()
  
 @cl.on_chat_end
 async def end():
