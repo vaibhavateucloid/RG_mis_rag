@@ -119,7 +119,7 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
                     contents=prompt,
                     config={
                         'temperature': 0.0,
-                        'max_output_tokens': 1000
+                        'max_output_tokens': 5000
                     }
                 )
                 if response and hasattr(response, "candidates") and response.candidates and \
@@ -188,7 +188,7 @@ class ExecutiveAgent:
             if chat_history and hasattr(self, '_parent_system'):
                 enhanced_query = self._parent_system._contextualize_query(original_query or query, chat_history)
             # Retrieve relevant data using enhanced query
-            results = self.vector_store.similarity_search_with_score(enhanced_query, k=10)
+            results = self.vector_store.similarity_search_with_score(enhanced_query, k=20)
             
             # Prepare context from retrieved data
             context_parts = []
@@ -284,7 +284,7 @@ ANALYSIS:"""
                 config={
                     'temperature': 0.2,
                     'top_p': 0.8,
-                    'max_output_tokens': 20000,
+                    'max_output_tokens': 25000,
                 }
             )
             if response and hasattr(response, "candidates") and response.candidates and \
@@ -345,7 +345,7 @@ Generate 8-10 specific sub-queries that will help analyze this comprehensively. 
 - Base metrics (EBITDA, Revenue for specific periods)
 - Comparative analysis if multiple periods/products mentioned
 - NRR (Net Revenue Retention) and GRR (Gross Revenue Retention)
-- Top accounts, Department Spending, COGS, Monetization
+- Top accounts (found in the top accounts section for each product), Department Spending, COGS, Monetization
 - "Rule of 40", Sales multiple, LTV2CAC (LTV to CAC ration)
 - Investment Summary, Cashflow, M-o-M Cash Movement, Collection, Day of sales outstanding
 - Monetisation for different products and services
@@ -358,7 +358,7 @@ Return only the sub-queries, one per line, without numbering or explanations."""
             response = self._call_llm_with_fallback(
                 model="gemini-2.5-flash",
                 contents=prompt,
-                config={'temperature': 0.4, 'max_output_tokens': 10000}
+                config={'temperature': 0.4, 'max_output_tokens': 15000}
             )
             if response and hasattr(response, "candidates") and response.candidates and \
                response.candidates[0] is not None and \
@@ -409,19 +409,22 @@ class CFAAgent:
             enhanced_sub_query = sub_query
             if chat_history and hasattr(self, '_parent_system'):
                 enhanced_sub_query = self._parent_system._contextualize_query(sub_query, chat_history)
+            
             # If your vector store has an async API, use await here. Otherwise, run in executor.
             loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(None, self.vector_store.similarity_search_with_score, enhanced_sub_query, 7)
+            results = await loop.run_in_executor(None, self.vector_store.similarity_search_with_score, enhanced_sub_query, 15)
+            
             chunk_data_list = []
             for doc, score in results:
-                    chunk_data = {
-                        'content': doc.page_content,
-                        'score': score,
-                        'metadata': doc.metadata,
-                        'sub_query': sub_query
-                    }
-            chunk_data_list.append(chunk_data)
-            logging.info(f"✅ **THINKING**: Retrieved {len(results)} chunks for sub-query '{sub_query}'")
+                chunk_data = {
+                    'content': doc.page_content,
+                    'score': score,
+                    'metadata': doc.metadata,
+                    'sub_query': sub_query
+                }
+                chunk_data_list.append(chunk_data)  # ✅ MOVED INSIDE the for loop
+            
+            logging.info(f"✅ **THINKING**: Retrieved {len(chunk_data_list)} chunks for sub-query '{sub_query}'")
             return chunk_data_list
 
         # Launch all retrievals in parallel
@@ -510,7 +513,7 @@ ANALYSIS:"""
                 config={
                     'temperature': 0.1,
                     'top_p': 0.8,
-                    'max_output_tokens': 20000,
+                    'max_output_tokens': 25000,
                 }
             )
             if response and hasattr(response, "candidates") and response.candidates and \
@@ -841,7 +844,7 @@ ENHANCED QUERY:"""
                     return
                 # Contextualize query before retrieval
                 enhanced_question = self._contextualize_query(question, history)
-                results = self.vector_store.similarity_search_with_score(enhanced_question, k=10)
+                results = self.vector_store.similarity_search_with_score(enhanced_question, k=20)
                 logging.debug(f"[RAG] Direct factual query: Retrieved {len(results)} chunks")
                 context_parts = []
                 sources = []
