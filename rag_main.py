@@ -119,7 +119,7 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
                     contents=prompt,
                     config={
                         'temperature': 0.0,
-                        'max_output_tokens': 10
+                        'max_output_tokens': 1000
                     }
                 )
                 if response and hasattr(response, "candidates") and response.candidates and \
@@ -177,14 +177,18 @@ class ExecutiveAgent:
         self.genai_client = genai_client
         self._call_llm_with_fallback = llm_fallback_fn
     
-    async def analyze_executive_summary(self, query: str, context: str = "") -> typing.AsyncGenerator[Dict, None]:
+    async def analyze_executive_summary(self, query: str, context: str = "", original_query: str = None, chat_history: list = None) -> typing.AsyncGenerator[Dict, None]:
         """Perform executive-level analysis with concise insights."""
         import asyncio
         
         # Do not yield thinking steps for executive agent, only yield the final answer
         try:
-            # Retrieve relevant data
-            results = self.vector_store.similarity_search_with_score(query, k=10)
+            # Contextualize query before retrieval if chat history provided
+            enhanced_query = query
+            if chat_history and hasattr(self, '_parent_system'):
+                enhanced_query = self._parent_system._contextualize_query(original_query or query, chat_history)
+            # Retrieve relevant data using enhanced query
+            results = self.vector_store.similarity_search_with_score(enhanced_query, k=10)
             
             # Prepare context from retrieved data
             context_parts = []
@@ -200,7 +204,7 @@ class ExecutiveAgent:
             full_context = "\n".join(context_parts)
             
             # Generate executive summary
-            analysis = self._generate_executive_analysis(query, full_context, context)
+            analysis = self._generate_executive_analysis(original_query or query, full_context, context, chat_history)
             
             yield {"type": "answer", "content": analysis, "sources": sources[:5]}
             
@@ -208,7 +212,7 @@ class ExecutiveAgent:
             logging.error(f"❌ Error in executive analysis: {str(e)}")
             yield {"type": "error", "content": f"❌ Error generating executive summary: {str(e)}"}
     
-    def _generate_executive_analysis(self, query: str, retrieved_context: str, conversation_context: str) -> str:
+    def _generate_executive_analysis(self, query: str, retrieved_context: str, conversation_context: str, chat_history: list) -> str:
         """Generate executive-level analysis with concise insights."""
         
         prompt = f"""You are a senior executive advisor for RateGain Travel Technologies, a global provider of SaaS solutions for travel and hospitality industry. Provide a concise executive summary (200-300 words) with key insights.
@@ -280,7 +284,7 @@ ANALYSIS:"""
                 config={
                     'temperature': 0.2,
                     'top_p': 0.8,
-                    'max_output_tokens': 8000,
+                    'max_output_tokens': 20000,
                 }
             )
             if response and hasattr(response, "candidates") and response.candidates and \
@@ -352,7 +356,7 @@ Return only the sub-queries, one per line, without numbering or explanations."""
         
         try:
             response = self._call_llm_with_fallback(
-                model="gemini-2.5-pro",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config={'temperature': 0.4, 'max_output_tokens': 10000}
             )
@@ -378,7 +382,7 @@ class CFAAgent:
         self._call_llm_with_fallback = llm_fallback_fn
         self.sub_query_generator = SubQueryGenerator(genai_client, llm_fallback_fn)
     
-    async def analyze_with_thinking(self, query: str, context: str = "") -> typing.AsyncGenerator[Dict, None]:
+    async def analyze_with_thinking(self, query: str, context: str = "", original_query: str = None, chat_history: list = None) -> typing.AsyncGenerator[Dict, None]:
         """Perform deep financial analysis with live thinking display as an async generator."""
         import asyncio
         yield {"type": "thinking", "content": "🧠 **THINKING**: Starting CFA analysis..."}
@@ -387,34 +391,44 @@ class CFAAgent:
         yield {"type": "thinking", "content": "🔍 **THINKING**: Generating analytical sub-queries..."}
         await asyncio.sleep(0)
         logging.info("🔍 **THINKING**: Generating analytical sub-queries...")
-        sub_queries = self.sub_query_generator.generate_sub_queries(query, context)
+        sub_queries = self.sub_query_generator.generate_sub_queries(original_query or query, context)
         if not sub_queries:
             yield {"type": "thinking", "content": "⚠️ **THINKING**: Using fallback analysis approach..."}
             await asyncio.sleep(0)
             logging.warning("⚠️ **THINKING**: Using fallback analysis approach...")
-            sub_queries = [query]
+            sub_queries = [original_query or query]
         yield {"type": "thinking", "content": f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:"}
         await asyncio.sleep(0)
         logging.info(f"📋 **THINKING**: Generated {len(sub_queries)} sub-queries:")
         for sq in sub_queries:
             yield {"type": "thinking", "content": f"• {sq}"}
             await asyncio.sleep(0)
-        all_retrieved_data = []
-        for i, sub_query in enumerate(sub_queries, 1):
-            logging.info(f"🔍 **THINKING**: Processing sub-query {i}/{len(sub_queries)}: {sub_query}")
-            try:
-                results = self.vector_store.similarity_search_with_score(sub_query, k=7)
-                for doc, score in results:
+
+        # --- Parallelize retrieval for all sub-queries using asyncio.gather ---
+        async def retrieve_chunks(sub_query):
+            enhanced_sub_query = sub_query
+            if chat_history and hasattr(self, '_parent_system'):
+                enhanced_sub_query = self._parent_system._contextualize_query(sub_query, chat_history)
+            # If your vector store has an async API, use await here. Otherwise, run in executor.
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(None, self.vector_store.similarity_search_with_score, enhanced_sub_query, 7)
+            chunk_data_list = []
+            for doc, score in results:
                     chunk_data = {
                         'content': doc.page_content,
                         'score': score,
                         'metadata': doc.metadata,
                         'sub_query': sub_query
                     }
-                    all_retrieved_data.append(chunk_data)
-                logging.info(f"✅ **THINKING**: Retrieved {len(results)} chunks for sub-query {i}")
-            except Exception as e:
-                logging.error(f"❌ **THINKING**: Error retrieving data for sub-query {i}: {str(e)}")
+            chunk_data_list.append(chunk_data)
+            logging.info(f"✅ **THINKING**: Retrieved {len(results)} chunks for sub-query '{sub_query}'")
+            return chunk_data_list
+
+        # Launch all retrievals in parallel
+        all_retrieved_lists = await asyncio.gather(*(retrieve_chunks(sq) for sq in sub_queries))
+        all_retrieved_data = [item for sublist in all_retrieved_lists for item in sublist]
+        # --- End parallelization ---
+
         unique_data = []
         seen_content = set()
         for data in all_retrieved_data:
@@ -423,11 +437,11 @@ class CFAAgent:
                 seen_content.add(data['content'])
         logging.info(f"📊 **THINKING**: Compiled {len(unique_data)} unique chunks for analysis")
         logging.info("🤖 **THINKING**: Performing comprehensive financial analysis...")
-        analysis = self._generate_cfa_analysis(query, unique_data, context)
+        analysis = self._generate_cfa_analysis(original_query or query, unique_data, context, chat_history)
         logging.info("✅ **THINKING**: Analysis complete!")
         yield {"type": "answer", "content": analysis, "sources": self._format_sources(unique_data)}
     
-    def _generate_cfa_analysis(self, query: str, retrieved_data: List[Dict], context: str) -> str:
+    def _generate_cfa_analysis(self, query: str, retrieved_data: List[Dict], context: str, chat_history: list) -> str:
         """Generate comprehensive CFA analysis."""
         
         # Prepare context from retrieved data
@@ -541,26 +555,63 @@ class EnhancedRAGSystem:
         SYSTEM INSTRUCTIONS:
         You are LumenAI - RG Chatbot, an advanced financial analyst and executive advisor chatbot for RateGain Travel Technologies.
         
-        ROLES:
-        - Act as a senior Chartered Financial Analyst (CFA) for deep financial analysis.
-        - Act as an executive advisor for concise, business-focused summaries.
-        - Act as a direct factual assistant for quick, accurate answers.
-        
-        FUNCTIONS & CAPABILITIES:
-        - Answer direct factual questions about RateGain's financials, segments, and products.
-        - Provide executive-level summaries with key business insights and implications.
-        - Perform deep analytical breakdowns, including root cause analysis, trends, and metric deep-dives.
-        - Generate and answer sub-queries for comprehensive analysis.
-        - Use only the provided RateGain data and context; do not use external or fabricated information.
-        - Always cite sources when possible (except in executive summaries, as instructed).
-        - Focus on key SaaS metrics: NRR, GRR, Retention, top accounts, "rule of 40", sales multiple, LTV2CAC, etc.
-        - Always try to give an answer.
-        
-        DATA SOURCES:
-        - You have access to the Investor Presentation on the Un-audited (Standalone and Consolidated) Financial Results of the Company for all four quarters.
-        - This presentation contains comprehensive information about the company, its business, key updates, operating revenue, EBITDA, PAT, gross revenue retention, client count, LTV to CAC, revenue by engagement, travel type, geography, customer segments, growth metrics, highlights, achievements, product and innovation details, detailed financials (including sustained financials and profitability metrics), consolidated profit and loss, cash flow statement, industry trends, company overview, and shareholders information.
-        - Refer to the Investor Presentation whenever relevant to answer questions about the company, its business, products, metrics, or financials.
-        - If there is conflicting information from different sources, always refer to and use the latest available data.
+        ABOUT RATEGAIN:
+        - RateGain is a B2B travel technology company with three main business segments:
+            1. DaaS (Data-as-a-Service): Travel BI, Hospi BI
+            2. Distribution: Enterprise Connectivity, Channel Manager, Uno
+            3. Martech: BCV, MHS, Adara
+        - Detailed financials are available for all three segments and their subproducts. Always provide the most granular analysis possible (segment, product, sub-product, region, account, month, etc.).
+        - Geographical data is available from MIS reports for different regions of the world.
+
+        DATA SOURCES & COVERAGE:
+        - The knowledge base consists of three types of documents:
+            A. MIS Reports (monthly):
+                - Available for ten months: April 2024 to March 2025, except January and February 2025 (missing).
+                - Each report contains detailed financial and operational data for every product and sub-product, with YTD and prior year comparisons.
+                - Six sections: Executive Summary (KPI dashboard, visuals, CEO dashboard, GRR/NRR, headcount), Financials (P&L, GAAP Revenue, COGS, GM, expenses, breakdowns by segment/product/sub-product), Key Accounts (top 15-20 accounts per product, revenue, growth, remarks), Region-wise new sales review, Cash & Investments (cashflow, investments, DSO, collections), Others (monetization, orderbook, marketing ROI, KPIs).
+                - Data is mostly in USD thousands unless specified otherwise.
+                - Each report is structured similarly, but may have minor changes month-to-month.
+                - Visuals (charts, graphs, heatmaps) are present and should be used for insights.
+                - For any metric, search deeply in the relevant month's report before declaring data unavailable. Temporal awareness is critical: if a user asks for a specific month, use that month's MIS report.
+            B. Investor Presentations (quarterly):
+                - Available for Q1, Q2, Q3, Q4 of FY 24-25.
+                - Focused on high-level, company-wide financials (operating revenue, EBITDA, PAT, efficiency, P&L, balance sheet, cash flow, industry trends, shareholders).
+                - Data is in INR million unless specified.
+                - Useful for high-level, investor-focused analysis, not for granular product/segment breakdowns.
+            C. Earnings Call Transcripts (quarterly):
+                - Available for all four quarters of FY 24-25.
+                - Contains management commentary, Q&A, future plans, and qualitative insights. Use for context, management intent, and qualitative analysis.
+
+        TEMPORAL AWARENESS:
+        - The current date is July 2025. All data is for the previous financial year (FY 24-25).
+        - MIS reports: April 2024 to March 2025 (except Jan/Feb 2025 missing).
+        - Quarterly reports and transcripts: all four quarters of FY 24-25 are available.
+        - Always be precise about the time period of the data you use. If a user asks for a specific month, use that month's data. If unavailable, state so clearly.
+
+        GRANULARITY & ANALYSIS:
+        - Always answer at the most granular level possible: segment, product, sub-product, region, account, month, etc.
+        - Use all available data, including visuals and tables, for your analysis.
+        - If a user asks for a metric, search all relevant sections and documents before stating data is unavailable.
+        - Currency: USD thousands for MIS reports, INR million for investor presentations (unless otherwise specified).
+
+        SPECIAL INSTRUCTIONS:
+        - Do NOT fabricate or infer data not present in the sources.
+        - If relevant, cite the document and page number for each data point (except in executive summaries).
+        - If a user asks for data outside the available scope, explain the limitation.
+        - Use management commentary and qualitative insights from transcripts to supplement quantitative answers where appropriate.
+        - If a user asks for a high-level summary, use investor presentations and transcripts. For granular/product-level questions, use MIS reports.
+        - Always clarify the time period, segment, and product/sub-product in your answers.
+        - If visuals (charts, graphs, heatmaps) are available, use them for insights and mention them in your answer.
+        - If a user asks for a comparison, use YTD and prior year data from MIS reports, and QoQ/YoY data from investor presentations.
+        - If a user asks for top accounts, use the Key Accounts section of the MIS reports.
+        - If a user asks for cash flow, DSO, or investment data, use the Cash & Investments section of the MIS reports.
+        - If a user asks for operational metrics, use the CEO dashboard and Executive Summary of the MIS reports.
+        - If a user asks for region-wise data, use the region-wise new sales review section of the MIS reports.
+        - If a user asks for monetization, orderbook, or marketing ROI, use the Others section of the MIS reports.
+        - If a user asks for headcount, use the headcount tables and visuals in the Executive Summary of the MIS reports.
+        - If a user asks for industry trends or company overview, use the investor presentations.
+        - If a user asks for management's perspective or future plans, use the earnings call transcripts.
+        - If a user asks for a metric or data point that is not available, state clearly that the data is not available and explain why (e.g., missing report, not tracked, etc.).
         
         GUARDRAILS:
         - Do not hallucinate on the user's question. Stay relevant to the user's question.
@@ -568,7 +619,6 @@ class EnhancedRAGSystem:
         - Do NOT hallucinate or invent data.
         - Do NOT provide investment, legal, or tax advice.
         - Do NOT answer questions unrelated to RateGain or the provided data.
-        - If unsure or data is missing, clearly state so.
         - Be concise, professional, and data-driven in all responses.
         """
     )
@@ -688,10 +738,70 @@ class EnhancedRAGSystem:
         self.executive_agent = ExecutiveAgent(self.vector_store, self.embeddings, self.genai_client, self._call_llm_with_fallback)
         self.query_classifier = QueryClassifier(genai_client=self.genai_client)
         self.conversation_history = []  # Store full chat history as list of dicts
-        
+        # Add parent system reference to agents
+        self.cfa_agent._parent_system = self
+        self.executive_agent._parent_system = self
         logging.info("✅ CFA Agent and Executive Agent initialized")
-        
         logging.info("✅ Enhanced RAG System ready!")
+
+    def _contextualize_query(self, original_query: str, chat_history: list) -> str:
+        """
+        Contextualize query using chat history for better retrieval.
+        Always uses last 4 messages to decide and enhance if needed.
+        Leverage the LLM to infer and retain time period and entity context, without hardcoded extraction.
+        """
+        # Skip if no meaningful history
+        if not chat_history or len(chat_history) < 2:
+            return original_query
+        try:
+            # Extract recent conversation (last 4 messages)
+            recent_history = chat_history[-4:] if len(chat_history) > 4 else chat_history
+            # Build conversation context
+            context_parts = []
+            for msg in recent_history:
+                if msg.get("role") in ["user", "assistant"]:
+                    content = msg["content"]
+                    if msg["role"] == "assistant" and len(content) > 300:
+                        content = content[:300] + "..."
+                    context_parts.append(f"{msg['role']}: {content}")
+            recent_context = "\n".join(context_parts)
+
+            # LLM prompt: let the LLM infer and retain time period/entity context
+            contextualization_prompt = f"""You are a query enhancement assistant. Your job is to make the user's question self-contained for retrieval, by inferring and retaining any relevant time period (month, quarter, year, fiscal year) and entity (segment, product, sub-product, region, account, etc.) from the conversation history and the current question.
+
+CONVERSATION HISTORY:
+{recent_context}
+
+CURRENT QUESTION: {original_query}
+
+INSTRUCTIONS:
+- If the user's question references previous context (like 'it', 'that', 'further', etc.) or would benefit from specific entities or timeframes from the conversation, rewrite it to be self-contained.
+- Always preserve and explicitly include any time period (month, quarter, year, fiscal year) and entity (segment, product, sub-product, region, account, etc.) that is present or can be inferred from the conversation history or the question.
+- If the question is already self-contained, return it unchanged.
+- Keep the enhanced query concise and focused, but do not omit any relevant temporal or entity context.
+
+ENHANCED QUERY:"""
+            response = self._call_llm_with_fallback(
+                model="gemini-2.5-flash",
+                contents=contextualization_prompt,
+                config={
+                    'temperature': 0.1,
+                    'max_output_tokens': 5000
+                }
+            )
+            if response and hasattr(response, "candidates") and response.candidates and \
+               response.candidates[0] is not None and \
+               hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
+                enhanced_query = response.candidates[0].content.parts[0].text.strip()
+                # Use enhanced query if it's different and reasonable
+                if 10 <= len(enhanced_query) <= 500 and enhanced_query != original_query:
+                    logging.info(f"🔄 Query contextualized: '{original_query}' → '{enhanced_query}'")
+                    return enhanced_query
+            return original_query
+        except Exception as e:
+            logging.warning(f"Query contextualization failed, using original: {e}")
+            return original_query
 
     def _build_context_from_history(self, history, new_user_message: Optional[str] = None):
         context_lines = []
@@ -721,7 +831,6 @@ class EnhancedRAGSystem:
         if query_type == QueryType.DIRECT_FACTUAL:
             logging.debug("[RAG] Processing direct factual query")
             try:
-                # Yield custom thinking steps for direct factual
                 yield {"type": "thinking", "content": "📊 **Direct Factual Query Mode**"}
                 yield {"type": "thinking", "content": "🔎 **Fetching data...**"}
                 if self.vector_store is None:
@@ -730,7 +839,9 @@ class EnhancedRAGSystem:
                 if self.genai_client is None:
                     yield {"type": "error", "content": "❌ Gemini client is not initialized."}
                     return
-                results = self.vector_store.similarity_search_with_score(question, k=10)
+                # Contextualize query before retrieval
+                enhanced_question = self._contextualize_query(question, history)
+                results = self.vector_store.similarity_search_with_score(enhanced_question, k=10)
                 logging.debug(f"[RAG] Direct factual query: Retrieved {len(results)} chunks")
                 context_parts = []
                 sources = []
@@ -742,9 +853,7 @@ class EnhancedRAGSystem:
                         'score': score
                     })
                 full_context_data = "\n".join(context_parts)
-                
                 prompt = f"""{self.SYSTEM_PROMPT}\n\nYou are a financial analyst assistant for RateGain Travel Technologies. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{system_context}\n\nFINANCIAL DATA:\n{full_context_data}\n\nUSER QUESTION: {question}\n\nIMPORTANT:\n- Only use information present in the provided sources.\n- Do not make up or infer data that is not explicitly present.\n- Provide a direct, accurate answer with specific numbers. Be concise but complete.\n- Do not include inline source citations."""
-                
                 try:
                     response = self._call_llm_with_fallback(
                         model=self.generation_model,
@@ -755,7 +864,6 @@ class EnhancedRAGSystem:
                     logging.error(f"Error generating direct factual answer (both keys failed): {e}")
                     yield {"type": "error", "content": f"❌ Error processing query: {str(e)}"}
                     return
-                # Yield data fetched and ready steps before answer
                 yield {"type": "thinking", "content": "✅ **Data fetched!** (step 1/1)"}
                 yield {"type": "thinking", "content": "📤 **Ready to share the data**"}
                 if response and hasattr(response, "candidates") and response.candidates and \
@@ -781,17 +889,16 @@ class EnhancedRAGSystem:
         
         elif query_type == QueryType.EXECUTIVE_ANALYTICAL:
             logging.debug("[RAG] Processing executive analytical query")
-            # Yield custom thinking steps for executive analytical
             yield {"type": "thinking", "content": "📈 **Executive Analytical Query Mode**"}
             yield {"type": "thinking", "content": "🔎 **Compiling executive summary...**"}
             if self.executive_agent is None:
                 yield {"type": "error", "content": "❌ Executive agent is not initialized."}
                 return
-            async for item in self.executive_agent.analyze_executive_summary(question, system_context):
+            async for item in self.executive_agent.analyze_executive_summary(question, system_context, question, history):
                 logging.debug(f"[RAG] Yielding executive agent item: {item}")
                 if item["type"] == "answer":
                     yield {"type": "thinking", "content": "✅ **Summary compiled!** (step 1/1)"}
-                    yield {"type": "thinking", "content": "📤 **Ready to share executive insights**"}
+                    yield {"type": "thinking", "content": "📤 **Ready to share executive insights"}
                     yield item
             self.query_classifier.add_to_history(question, 'executive_analytical')
         
@@ -800,7 +907,7 @@ class EnhancedRAGSystem:
             if self.cfa_agent is None:
                 yield {"type": "error", "content": "❌ CFA agent is not initialized."}
                 return
-            async for item in self.cfa_agent.analyze_with_thinking(question, system_context):
+            async for item in self.cfa_agent.analyze_with_thinking(question, system_context, question, history):
                 logging.debug(f"[RAG] Yielding CFA agent item: {item}")
                 yield item
             self.query_classifier.add_to_history(question, 'deep_analytical')

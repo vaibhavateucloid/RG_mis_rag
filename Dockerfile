@@ -21,4 +21,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8501 8000
 
 # Default command (adjust if you use Streamlit/Chainlit UI)
-CMD ["chainlit", "run", "rag_main.py"] 
+CMD ["chainlit", "run", "app_chain.py"] 

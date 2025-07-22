@@ -17,3 +17,5 @@ openai
 pymupdf
 pillow
 numpy
+torch==2.2.2
+chainlit

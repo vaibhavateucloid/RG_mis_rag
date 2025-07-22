@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment and secrets
+
+.envrc
+
+# Git
+.git
+.gitignore
+
+# Local data and cache
+/data/
+/extracted_images/
+/old_code/
+public
+*.log
+*.lock
+*.DS_Store
+*.ipynb
+.vscode/
+.idea/
+.history/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.venv/
+venv/
+.ruff_cache/
+
+# Docs and markdown
+README.md
+chainlit.md
+uv.lock
+
+# Misc
+*.bak
+*.swp
+*.tmp 
