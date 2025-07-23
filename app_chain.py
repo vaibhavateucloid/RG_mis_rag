@@ -1,4 +1,4 @@
-# Enhanced Chainlit App with Collapsible Live Thinking Display
+# Enhanced Chainlit App with Collapsible Live Thinking Display - FIXED VERSION
 import chainlit as cl
 from rag_main import EnhancedRAGSystem
 import logging
@@ -9,6 +9,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
  
 # Initialize RAG system
 rag_system = None
+
+# Constants for message handling
+MAX_MESSAGE_LENGTH = 50000  # Chainlit message length limit
+MAX_THINKING_LENGTH = 20000  # Limit accumulated thinking to prevent memory issues
  
 def initialize_rag():
     """Initialize the RAG system."""
@@ -16,7 +20,19 @@ def initialize_rag():
     if rag_system is None:
         rag_system = EnhancedRAGSystem()
     return rag_system
- 
+
+def truncate_message(content: str, max_length: int = MAX_MESSAGE_LENGTH) -> str:
+    """Truncate message if it exceeds length limit."""
+    if len(content) <= max_length:
+        return content
+    
+    # Try to truncate at a logical point (end of section)
+    truncate_point = content.rfind('\n---\n', 0, max_length - 100)
+    if truncate_point > max_length // 2:  # Only if we found a good truncation point
+        return content[:truncate_point] + "\n\n... [Content truncated for display] ..."
+    else:
+        return content[:max_length - 50] + "\n\n... [Content truncated] ..."
+
 def format_thinking_content(step_content):
     """Format thinking content for better display."""
     if "🧠 **THINKING**:" in step_content:
@@ -105,7 +121,7 @@ async def retrieve_sources(sources):
  
 @cl.on_message
 async def main(message: cl.Message):
-    """Main message handler with collapsible real-time thinking display."""
+    """Main message handler with collapsible real-time thinking display - FIXED VERSION."""
     logging.info(f"User submitted question: {message.content}")
    
     # Get RAG system from session
@@ -133,6 +149,7 @@ async def main(message: cl.Message):
     thinking_step = None
     is_cfa_analysis = False
     accumulated_thinking = ""
+    max_steps_before_summary = 15  # Prevent too many steps
    
     try:
         # Process query with real-time thinking display
@@ -157,21 +174,32 @@ async def main(message: cl.Message):
                     thinking_step.input = "🔄 Starting deep CFA analysis..."
                     accumulated_thinking = "🔄 **Initializing Analysis**\n\nStarting comprehensive financial analysis process...\n\n---\n\n"
                
-                # Add new thinking step to accumulated content
-                accumulated_thinking += f"{formatted_thinking}\n\n---\n\n"
+                # Add new thinking step to accumulated content with length control
+                new_step_content = f"{formatted_thinking}\n\n---\n\n"
+                accumulated_thinking += new_step_content
+                
+                # Keep accumulated thinking under control
+                if len(accumulated_thinking) > MAX_THINKING_LENGTH:
+                    # Keep only the last portion and add a note about truncation
+                    truncation_point = accumulated_thinking.find('\n---\n', len(accumulated_thinking) - MAX_THINKING_LENGTH + 1000)
+                    if truncation_point > 0:
+                        accumulated_thinking = "...[Earlier steps truncated]...\n\n" + accumulated_thinking[truncation_point:]
+                    else:
+                        accumulated_thinking = accumulated_thinking[-MAX_THINKING_LENGTH:] 
                
                 # Update the step output with accumulated thinking
-                thinking_step.output = f"{accumulated_thinking}⏳ **Processing... ({step_count} steps completed)**"
+                progress_text = f"⏳ **Processing... ({step_count} steps completed)**"
+                if step_count > max_steps_before_summary:
+                    progress_text = f"⏳ **Processing... ({step_count} steps completed - wrapping up)**"
+                
+                thinking_step.output = f"{accumulated_thinking}{progress_text}"
                
-                # Stream the new content token by token for better UX
-                new_content = f"{formatted_thinking}\n\n---\n\n"
-                for char in new_content:
-                    await thinking_step.stream_token(char)
-                    await asyncio.sleep(0.01)  # Small delay for streaming effect
+                # FIXED: Simplified streaming - no character-by-character streaming
+                # Just update the step content in larger chunks to avoid race conditions
+                await thinking_step.update()
                
                 # Update step name to show progress
                 thinking_step.name = f"🧠 Live Analysis Process ({step_count} steps) - Click to expand"
-                await thinking_step.update()
                
             elif response["type"] == "answer":
                 final_answer = response["content"]
@@ -188,7 +216,7 @@ async def main(message: cl.Message):
                 chat_history.append({"role": "assistant", "content": final_answer})
                 cl.user_session.set("chat_history", chat_history)
                
-                logging.info(f"Assistant response generated: {final_answer}")
+                logging.info(f"Assistant response generated: {final_answer[:200]}... (length: {len(final_answer)})")
                 break  # Exit the loop once we get the answer
                
             elif response["type"] == "error":
@@ -223,28 +251,51 @@ async def main(message: cl.Message):
         await cl.Message(content=f"❌ **Error**: {error_msg}").send()
         return
    
-    # Add delay before sending final answer
-    await asyncio.sleep(0.3)
+    # FIXED: Add delay and ensure clean state before sending final answer
+    await asyncio.sleep(0.5)  # Give thinking step time to complete
    
-    # Send the final answer
+    # Send the final answer with improved error handling
     if final_answer:
         try:
-            # Create the final answer message
-            await cl.Message(content=final_answer).send()
-            logging.info("Final message sent successfully to UI")
+            # FIXED: Check and truncate message if too long
+            truncated_answer = truncate_message(final_answer, MAX_MESSAGE_LENGTH)
+            
+            if len(final_answer) != len(truncated_answer):
+                logging.warning(f"Message truncated from {len(final_answer)} to {len(truncated_answer)} characters")
+            
+            # Create the final answer message with timeout protection
+            try:
+                message_task = asyncio.create_task(cl.Message(content=truncated_answer).send())
+                await asyncio.wait_for(message_task, timeout=30.0)  # 30 second timeout
+                logging.info("Final message sent successfully to UI")
+            except asyncio.TimeoutError:
+                logging.error("Timeout sending final message - trying fallback")
+                # Fallback: try with much shorter message
+                short_answer = final_answer[:5000] + "\n\n... [Message truncated due to display issues. Please ask for specific sections if needed.]"
+                await cl.Message(content=short_answer).send()
+                logging.info("Fallback short message sent")
            
             # Add delay before sources
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
            
             # Send sources as a separate collapsible step if available
             if final_sources:
-                async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
-                    sources_text = await retrieve_sources(final_sources)
-                    sources_step.output = f"**Retrieved {len(final_sources)} sources:**\n\n{sources_text}"
+                try:
+                    async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
+                        sources_text = await retrieve_sources(final_sources)
+                        sources_step.output = f"**Retrieved {len(final_sources)} sources:**\n\n{sources_text}"
+                except Exception as source_error:
+                    logging.error(f"Error displaying sources: {source_error}")
+                    # Don't fail the whole response for source display issues
                    
         except Exception as e:
             logging.error(f"Error sending final message: {e}")
-            await cl.Message(content=f"❌ Error displaying results: {str(e)}").send()
+            # Emergency fallback
+            try:
+                emergency_msg = f"✅ **Analysis Complete**\n\nAnalysis was completed successfully but there was a display issue. Please try asking for specific parts of the analysis or refresh the page.\n\n**Error details**: {str(e)}"
+                await cl.Message(content=emergency_msg).send()
+            except Exception as emergency_error:
+                logging.error(f"Emergency message also failed: {emergency_error}")
     else:
         logging.warning("No final answer to send")
         await cl.Message(content="❌ No response generated").send()
