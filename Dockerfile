@@ -10,6 +10,7 @@ WORKDIR /app
 # Copy requirements and install dependencies
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install chainlit
 
 # Copy the rest of the code, including data_vector_store
 COPY . .
@@ -20,5 +21,5 @@ ENV PYTHONUNBUFFERED=1
 # Expose ports (adjust as needed)
 EXPOSE 8501 8000
 
-# Default command (adjust if you use Streamlit/Chainlit UI)
-CMD ["chainlit", "run", "app_chain.py", "--host", "10.221.2.236", "--port", "8000"] 
+# Default command (adjust if you use Streamlit/Chainlit UI)a
+CMD ["chainlit", "run", "app_chain.py", "--host", "0.0.0.0", "--port", "8000"]
