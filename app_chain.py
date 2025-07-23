@@ -3,6 +3,7 @@ import chainlit as cl
 from rag_main import EnhancedRAGSystem
 import logging
 import asyncio
+from typing import Optional, List, TypedDict, Union
  
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -71,6 +72,8 @@ async def start():
     """Initialize the chat session."""
     logging.info("Chat session started.")
    
+    # (Logo message removed as per user request)
+
     # Show usage instructions on first access
     await cl.Message(
         content=(
@@ -119,11 +122,45 @@ async def retrieve_sources(sources):
     await asyncio.sleep(0.1)
     return sources_text
  
+# Add global cache for last question and answer
+class QACache(TypedDict):
+    question: Optional[str]
+    answer: Optional[str]
+    sources: Optional[List]
+
+last_qa_cache: QACache = {"question": None, "answer": None, "sources": None}
+
+def normalize_question(q):
+    return q.strip().lower() if isinstance(q, str) else q
+
 @cl.on_message
 async def main(message: cl.Message):
     """Main message handler with collapsible real-time thinking display - FIXED VERSION."""
     logging.info(f"User submitted question: {message.content}")
-   
+
+    # Check cache for last question/answer with normalization
+    global last_qa_cache
+    normalized_current = normalize_question(message.content)
+    normalized_cached = normalize_question(last_qa_cache["question"])
+    logging.info(f"[CACHE CHECK] Raw current: '{message.content}' | Raw cached: '{last_qa_cache['question']}'")
+    logging.info(f"[CACHE CHECK] Normalized current: '{normalized_current}' | Normalized cached: '{normalized_cached}'")
+    if normalized_cached == normalized_current and last_qa_cache["answer"]:
+        logging.info(f"CACHE HIT: '{normalized_current}' == '{normalized_cached}'")
+        if isinstance(last_qa_cache["answer"], str):
+            await cl.Message(content=last_qa_cache["answer"]).send()
+        else:
+            await cl.Message(content=str(last_qa_cache["answer"])).send()
+        if last_qa_cache["sources"]:
+            try:
+                async with cl.Step(name="📚 Sources", type="retrieval", show_input=False) as sources_step:
+                    sources_text = await retrieve_sources(last_qa_cache["sources"])
+                    sources_step.output = f"**Retrieved {len(last_qa_cache['sources'])} sources:**\n\n{sources_text}"
+            except Exception as source_error:
+                logging.error(f"Error displaying sources: {source_error}")
+        return
+    else:
+        logging.info(f"CACHE MISS: '{normalized_current}' != '{normalized_cached}'")
+
     # Get RAG system from session
     rag = cl.user_session.get("rag")
     if not rag:
@@ -132,6 +169,8 @@ async def main(message: cl.Message):
    
     # Get chat history (list of dicts)
     chat_history = cl.user_session.get("chat_history", [])
+    if chat_history is None:
+        chat_history = []
     logging.info(f"Current chat_history: {chat_history}")
    
     # Append user message to chat history
@@ -213,6 +252,8 @@ async def main(message: cl.Message):
                     await thinking_step.__aexit__(None, None, None)
                
                 # Append assistant response to chat history
+                if chat_history is None:
+                    chat_history = []
                 chat_history.append({"role": "assistant", "content": final_answer})
                 cl.user_session.set("chat_history", chat_history)
                
@@ -256,6 +297,10 @@ async def main(message: cl.Message):
    
     # Send the final answer with improved error handling
     if final_answer:
+        # Cache the last question and answer (normalized)
+        last_qa_cache["question"] = normalize_question(message.content)
+        last_qa_cache["answer"] = str(final_answer) if final_answer is not None else None
+        last_qa_cache["sources"] = list(final_sources) if final_sources else None
         try:
             # FIXED: Check and truncate message if too long
             truncated_answer = truncate_message(final_answer, MAX_MESSAGE_LENGTH)

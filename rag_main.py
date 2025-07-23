@@ -1,4 +1,4 @@
-# Enhanced RAG System with CFA Agent and Executive Agent
+# Enhanced RAG System with CFA Agent and Executive Agent - Optimized Retrieval
 
 import os
 import time
@@ -82,6 +82,112 @@ class GeminiEmbeddings:
         if not self.client:
             raise ValueError("Gemini client not loaded")
         return self._embed_with_retry(text)
+
+class IntelligentRetrieval:
+    """Intelligent retrieval optimization for vector search operations."""
+    
+    @staticmethod
+    def classify_subquery_complexity(sub_query: str) -> str:
+        """Classify sub-query complexity for optimal retrieval count."""
+        query_lower = sub_query.lower()
+        
+        # Complex multi-dimensional queries
+        complex_keywords = ['root cause', 'analyze', 'comprehensive', 'detailed analysis', 'drivers', 'trends', 'compare multiple', 'breakdown']
+        if any(keyword in query_lower for keyword in complex_keywords):
+            return 'complex'
+        
+        # Comparative queries
+        comparative_keywords = ['compare', 'vs', 'versus', 'difference', 'contrast', 'relative']
+        if any(keyword in query_lower for keyword in comparative_keywords):
+            return 'comparative'
+        
+        # Simple factual queries
+        simple_keywords = ['what was', 'what is', 'how much', 'show', 'list', 'value of', 'amount']
+        if any(keyword in query_lower for keyword in simple_keywords):
+            return 'simple'
+        
+        # Default to moderate complexity
+        return 'moderate'
+    
+    @staticmethod
+    def get_optimal_retrieval_count(sub_query: str, query_type: str = 'moderate') -> int:
+        """Get optimal initial retrieval count based on query characteristics."""
+        complexity = IntelligentRetrieval.classify_subquery_complexity(sub_query)
+        
+        retrieval_map = {
+            'simple': 5,
+            'moderate': 8,
+            'comparative': 10,
+            'complex': 12
+        }
+        
+        return retrieval_map.get(complexity, 8)
+    
+    @staticmethod
+    def apply_relevance_filtering(results: List[Tuple], min_score: float = 0.3, score_drop_threshold: float = 0.15) -> List[Tuple]:
+        """Apply intelligent relevance filtering to search results."""
+        if not results:
+            return results
+        
+        filtered_results = []
+        prev_score = None
+        
+        for doc, score in results:
+            # Always include first few results if they meet minimum threshold
+            if len(filtered_results) < 3 and score >= min_score:
+                filtered_results.append((doc, score))
+                prev_score = score
+                continue
+            
+            # Stop if score drops significantly
+            if prev_score and (prev_score - score) > score_drop_threshold:
+                break
+            
+            # Stop if score is too low
+            if score < min_score:
+                break
+            
+            filtered_results.append((doc, score))
+            prev_score = score
+            
+            # Cap at reasonable maximum
+            if len(filtered_results) >= 15:
+                break
+        
+        # Ensure minimum results for complex queries
+        if len(filtered_results) < 3 and len(results) >= 3:
+            return results[:3]
+        
+        return filtered_results
+    
+    @staticmethod
+    def detect_content_sufficiency(chunks: List[str], sub_query: str) -> bool:
+        """Detect if retrieved content is sufficient for the sub-query."""
+        if len(chunks) < 2:
+            return False
+        
+        # Simple heuristic: check for key terms coverage
+        query_lower = sub_query.lower()
+        key_terms = []
+        
+        # Extract potential key terms from query
+        financial_terms = ['revenue', 'ebitda', 'cost', 'profit', 'nrr', 'grr', 'retention', 'growth']
+        time_terms = ['q1', 'q2', 'q3', 'q4', 'january', 'february', 'march', 'april', 'may', 'june',
+                     'july', 'august', 'september', 'october', 'november', 'december', '2024', '2025']
+        product_terms = ['hospi bi', 'travel bi', 'daas', 'distribution', 'martech', 'connectivity']
+        
+        for term_list in [financial_terms, time_terms, product_terms]:
+            key_terms.extend([term for term in term_list if term in query_lower])
+        
+        if not key_terms:
+            return len(chunks) >= 5  # Default sufficiency for non-specific queries
+        
+        # Check coverage of key terms in retrieved content
+        combined_content = ' '.join(chunks).lower()
+        covered_terms = sum(1 for term in key_terms if term in combined_content)
+        coverage_ratio = covered_terms / len(key_terms) if key_terms else 0
+        
+        return coverage_ratio >= 0.7 and len(chunks) >= 3
 
 class QueryClassifier:
     """Classifies queries as direct factual, executive analytical, or deep analytical."""
@@ -177,6 +283,21 @@ class ExecutiveAgent:
         self.genai_client = genai_client
         self._call_llm_with_fallback = llm_fallback_fn
     
+    def _intelligent_retrieve(self, query: str, max_chunks: int = 20) -> List[Tuple]:
+        """Perform intelligent retrieval with relevance filtering."""
+        # Get optimal initial count
+        optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(query, 'executive')
+        initial_count = min(optimal_count, max_chunks)
+        
+        # Retrieve initial results
+        results = self.vector_store.similarity_search_with_score(query, k=initial_count)
+        
+        # Apply relevance filtering
+        filtered_results = IntelligentRetrieval.apply_relevance_filtering(results)
+        
+        logging.info(f"Executive retrieval: {len(results)} → {len(filtered_results)} chunks for query: {query[:50]}...")
+        return filtered_results
+    
     async def analyze_executive_summary(self, query: str, context: str = "", original_query: str = None, chat_history: list = None) -> typing.AsyncGenerator[Dict, None]:
         """Perform executive-level analysis with concise insights."""
         import asyncio
@@ -187,8 +308,9 @@ class ExecutiveAgent:
             enhanced_query = query
             if chat_history and hasattr(self, '_parent_system'):
                 enhanced_query = self._parent_system._contextualize_query(original_query or query, chat_history)
-            # Retrieve relevant data using enhanced query
-            results = self.vector_store.similarity_search_with_score(enhanced_query, k=20)
+            
+            # Use intelligent retrieval
+            results = self._intelligent_retrieve(enhanced_query)
             
             # Prepare context from retrieved data
             context_parts = []
@@ -215,62 +337,41 @@ class ExecutiveAgent:
     def _generate_executive_analysis(self, query: str, retrieved_context: str, conversation_context: str, chat_history: list) -> str:
         """Generate executive-level analysis with concise insights."""
         
-        prompt = f"""You are a senior executive advisor for RateGain Travel Technologies, a global provider of SaaS solutions for travel and hospitality industry. Provide a concise executive summary (200-300 words) with key insights.
+        prompt = f"""You are a senior financial advisor for RateGain Travel Technologies. Provide a concise executive summary focused on actionable business insights.
 
-ABOUT RATEGAIN:
-RateGain is a leading travel technology company serving 7000+ customers globally across hotels, airlines, car rentals, cruise lines, and travel agencies. The company operates through three main business segments:
+COMPANY CONTEXT:
+RateGain is a leading SaaS provider for travel/hospitality with 7000+ global customers across three segments:
+• DaaS: Travel BI and Hospi BI (business intelligence)
+• Distribution: Enterprise Connectivity, Channel Manager, Uno platform  
+• Martech: BCV competitive intelligence, MHS marketing automation, Adara data platform
 
-1. **DaaS (Data-as-a-Service)**: 
-   - Travel BI: Business intelligence for travel companies
-   - Hospi BI: Business intelligence for hospitality sector
+CONVERSATION CONTEXT: {conversation_context}
 
-2. **Distribution**: 
-   - Enterprise Connectivity: Channel management solutions
-   - Channel Manager: Distribution channel optimization
-   - Uno: Unified booking platform
-
-3. **Martech (Marketing Technology)**:
-   - BCV (Brand Compete View): Competitive intelligence
-   - MHS (Marketing Hub Solutions): Marketing automation
-   - Adara: Data-driven marketing platform
-
-CONVERSATION CONTEXT:
-{conversation_context}
-
-FINANCIAL DATA:
-{retrieved_context}
+FINANCIAL DATA: {retrieved_context}
 
 USER QUERY: {query}
 
-IMPORTANT:
-- Only use information present in the provided sources.
-- Do not make up or infer data that is not explicitly present.
-- Your summary must be concise but highly insightful.
-- Surface hidden, non-obvious, or counterintuitive insights that a typical reader might overlook.
-- Highlight patterns, anomalies, or trends that are not immediately apparent.
-
 EXECUTIVE SUMMARY REQUIREMENTS:
-- Length: 200-300 words maximum
-- Format: Use bullet points for key insights
-- Use tables for comparative analysis when comparing multiple items
-- Include specific metrics and percentages
-- Focus on business impact and actionable insights
-- Highlight at least one insight that is not obvious or is counterintuitive
-- No inline source citations
-- Structure: Brief overview, key insights (3-5 bullet points), business implications
+• Length: 200-300 words maximum
+• Focus on business impact and strategic implications
+• Include specific metrics and percentages from the data
+• Highlight non-obvious insights or patterns
+• Use bullet points for key findings
+• Tables for comparative data when relevant
+• No source citations in text
 
-RESPONSE FORMAT:
+FORMAT:
 ## Executive Summary
-[2-3 sentence overview]
+[2-3 sentence overview with key takeaway]
 
 ## Key Insights
-• [Key finding 1 with specific metrics]
-• [Key finding 2 with trend analysis]
-• [Key finding 3 with business impact]
-• [Non-obvious or hidden insight]
+• [Insight 1 with specific data]
+• [Insight 2 with trend/pattern]
+• [Insight 3 with business impact]
+• [Non-obvious finding]
 
-## Business Implications
-[Brief strategic implications]
+## Strategic Implications
+[Brief actionable recommendations]
 
 ---
 💡 *For detailed analysis, ask me to "elaborate" or "analyze further"*
@@ -314,45 +415,28 @@ class SubQueryGenerator:
     
     def generate_sub_queries(self, original_query: str, context: str = "") -> List[str]:
         """Generate sub-queries for deep financial analysis."""
-        prompt = f"""You are a Chartered Financial Analyst. Given the user's analytical query about RateGain financial data, generate a list of specific sub-queries that need to be answered to provide a comprehensive analysis.
+        prompt = f"""You are a Chartered Financial Analyst. Generate specific, focused sub-queries for comprehensive RateGain financial analysis.
 
-ABOUT RATEGAIN:
-RateGain is a leading travel technology company serving 7000+ customers globally across hotels, airlines, car rentals, cruise lines, and travel agencies. The company operates through three main business segments:
+COMPANY CONTEXT:
+RateGain: Leading travel tech SaaS with 7000+ customers
+• DaaS: Travel BI, Hospi BI  
+• Distribution: Enterprise Connectivity, Channel Manager, Uno
+• Martech: BCV, MHS, Adara
 
-1. **DaaS (Data-as-a-Service)**: 
-   - Travel BI: Business intelligence for travel companies
-   - Hospi BI: Business intelligence for hospitality sector
-
-2. **Distribution**: 
-   - Enterprise Connectivity: Channel management solutions
-   - Channel Manager: Distribution channel optimization
-   - Uno: Unified booking platform
-
-3. **Martech (Marketing Technology)**:
-   - BCV (Brand Compete View): Competitive intelligence
-   - MHS (Marketing Hub Solutions): Marketing automation
-   - Adara: Data-driven marketing platform
-
-AVAILABLE DATA: Revenue, EBITDA, Costs, Top Accounts, NRR (Net Revenue Retention), GRR (Gross Revenue Retention), Retention, Monetization, Department Spending, "rule of 40", sales multiple, LTV2CAC (LTV to CAC ratio)
+AVAILABLE METRICS: Revenue, EBITDA, Costs, NRR/GRR, Top Accounts, Department Spending, Rule of 40, LTV/CAC, Cashflow, Collections, Monetization
 TIME PERIOD: April 2024 - March 2025
 
-CONVERSATION CONTEXT:
-{context}
-
+CONVERSATION CONTEXT: {context}
 USER QUERY: {original_query}
 
-Generate 8-10 specific sub-queries that will help analyze this comprehensively. Focus especially on the following metrics as per relevance:
-- Base metrics (EBITDA, Revenue for specific periods)
-- Comparative analysis if multiple periods/products mentioned
-- NRR (Net Revenue Retention) and GRR (Gross Revenue Retention)
-- Top accounts (found in the top accounts section for each product), Department Spending, COGS, Monetization
-- "Rule of 40", Sales multiple, LTV2CAC (LTV to CAC ration)
-- Investment Summary, Cashflow, M-o-M Cash Movement, Collection, Day of sales outstanding
-- Monetisation for different products and services
+Generate 6-8 specific sub-queries that directly support analyzing this query. Focus on:
+• Base financial metrics relevant to the query
+• Comparative analysis if multiple periods/segments mentioned  
+• Key performance indicators (NRR, GRR, retention, top accounts)
+• Operational metrics (department spending, monetization, cashflow)
+• Only include sub-queries directly relevant to the user's question
 
-Only generate sub-queries that are directly relevant to the user's query and the provided business context. Do NOT go off topic or include unrelated financial concepts.
-
-Return only the sub-queries, one per line, without numbering or explanations."""
+Return sub-queries only, one per line, no numbering."""
         
         try:
             response = self._call_llm_with_fallback(
@@ -382,6 +466,31 @@ class CFAAgent:
         self._call_llm_with_fallback = llm_fallback_fn
         self.sub_query_generator = SubQueryGenerator(genai_client, llm_fallback_fn)
     
+    def _intelligent_retrieve(self, sub_query: str) -> List[Dict]:
+        """Perform intelligent retrieval for a sub-query."""
+        # Get optimal retrieval count
+        optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(sub_query, 'cfa')
+        
+        # Retrieve with optimal count
+        results = self.vector_store.similarity_search_with_score(sub_query, k=optimal_count)
+        
+        # Apply relevance filtering
+        filtered_results = IntelligentRetrieval.apply_relevance_filtering(results, min_score=0.25)
+        
+        # Convert to chunk data format
+        chunk_data_list = []
+        for doc, score in filtered_results:
+            chunk_data = {
+                'content': doc.page_content,
+                'score': score,
+                'metadata': doc.metadata,
+                'sub_query': sub_query
+            }
+            chunk_data_list.append(chunk_data)
+        
+        logging.info(f"CFA retrieval: {len(results)} → {len(filtered_results)} chunks for sub-query: {sub_query[:50]}...")
+        return chunk_data_list
+    
     async def analyze_with_thinking(self, query: str, context: str = "", original_query: str = None, chat_history: list = None) -> typing.AsyncGenerator[Dict, None]:
         """Perform deep financial analysis with live thinking display as an async generator."""
         import asyncio
@@ -410,19 +519,9 @@ class CFAAgent:
             if chat_history and hasattr(self, '_parent_system'):
                 enhanced_sub_query = self._parent_system._contextualize_query(sub_query, chat_history)
             
-            # If your vector store has an async API, use await here. Otherwise, run in executor.
+            # Use intelligent retrieval
             loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(None, self.vector_store.similarity_search_with_score, enhanced_sub_query, 15)
-            
-            chunk_data_list = []
-            for doc, score in results:
-                chunk_data = {
-                    'content': doc.page_content,
-                    'score': score,
-                    'metadata': doc.metadata,
-                    'sub_query': sub_query
-                }
-                chunk_data_list.append(chunk_data)  # ✅ MOVED INSIDE the for loop
+            chunk_data_list = await loop.run_in_executor(None, self._intelligent_retrieve, enhanced_sub_query)
             
             logging.info(f"✅ **THINKING**: Retrieved {len(chunk_data_list)} chunks for sub-query '{sub_query}'")
             return chunk_data_list
@@ -454,55 +553,35 @@ class CFAAgent:
         
         full_context = "\n".join(context_parts)
         
-        prompt = f"""You are a senior Chartered Financial Analyst (CFA) specializing in RateGain's financial performance. Provide a comprehensive financial analysis based on the data provided.
+        prompt = f"""You are a senior Chartered Financial Analyst specializing in RateGain's financial performance. Provide comprehensive, data-driven financial analysis.
 
-ABOUT RATEGAIN:
-RateGain is a leading travel technology company serving 7000+ customers globally across hotels, airlines, car rentals, cruise lines, and travel agencies. The company operates through three main business segments:
+COMPANY OVERVIEW:
+RateGain: Leading travel tech SaaS serving 7000+ global customers
+• DaaS Segment: Travel BI, Hospi BI (business intelligence solutions)
+• Distribution Segment: Enterprise Connectivity, Channel Manager, Uno platform  
+• Martech Segment: BCV competitive intelligence, MHS marketing automation, Adara data platform
 
-1. **DaaS (Data-as-a-Service)**: 
-   - Travel BI: Business intelligence for travel companies
-   - Hospi BI: Business intelligence for hospitality sector
-
-2. **Distribution**: 
-   - Enterprise Connectivity: Channel management solutions
-   - Channel Manager: Distribution channel optimization
-   - Uno: Unified booking platform
-
-3. **Martech (Marketing Technology)**:
-   - BCV (Brand Compete View): Competitive intelligence
-   - MHS (Marketing Hub Solutions): Marketing automation
-   - Adara: Data-driven marketing platform
-
-CONVERSATION CONTEXT:
-{context}
-
-FINANCIAL DATA:
-{full_context}
-
+CONVERSATION CONTEXT: {context}
+FINANCIAL DATA: {full_context}
 USER QUERY: {query}
 
-ANALYSIS REQUIREMENTS:
-1. **Executive Summary**: Start with key findings
-2. **Detailed Financial Analysis**: (Include the data points mentioned below as per relevance)
-   - Analyze EBITDA, Revenue, Costs systematically
-   - Identify trends, variances, and performance drivers
-   - Examine top accounts and customer dynamics
-   - Review department spending patterns
-   - Emphasize NRR (Net Revenue Retention), GRR (Gross Revenue Retention), Retention, top accounts, "rule of 40", sales multiple, and LTV2CAC (LTV to CAC ratio) wherever relevant
-   - Investment Summary, Cashflow, M-o-M Cash Movement, Collection, Day of sales outstanding whatever is relevant
-   - Monetisation for different products and services
-3. **Root Cause Analysis**: Explain the "why" behind numbers
-4. **Business Implications**: What this means for RateGain
-5. **Data-Driven Insights**: Include specific numbers, percentages, and comparisons
+ANALYSIS FRAMEWORK:
+1. **Executive Summary**: Key findings and business impact
+2. **Financial Analysis**: 
+   - Revenue, EBITDA, cost trends with specific numbers
+   - Performance drivers and variance analysis
+   - Customer metrics (NRR, GRR, top accounts) where relevant
+   - Operational efficiency (Rule of 40, LTV/CAC) where applicable
+3. **Root Cause Analysis**: Explain underlying drivers and reasons
+4. **Strategic Implications**: Business recommendations and outlook
 
-IMPORTANT:
-- Be factually accurate with all numbers
-- Reference specific time periods correctly (FY 2024-25: Apr 2024 - Mar 2025)
-- Provide actionable business insights
-- Use professional financial analysis language
-- Include specific account names and financial figures when available
-- Do not include inline source citations
-- If relevant, discuss NRR, GRR, Retention, top accounts, "rule of 40", sales multiple, and LTV2CAC in your analysis
+REQUIREMENTS:
+• Use specific financial figures, percentages, and timeframes from the data
+• Identify non-obvious patterns and insights
+• Reference FY 24-25 timeframe (Apr 2024 - Mar 2025) correctly
+• Include segment/product-level analysis when relevant
+• Focus on actionable business insights
+• Professional CFA-level analysis depth
 
 ANALYSIS:"""
 
@@ -519,7 +598,7 @@ ANALYSIS:"""
             if response and hasattr(response, "candidates") and response.candidates and \
                response.candidates[0] is not None and \
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
-               hasattr(response.candidates[0], "content") and response.candidates[0].content.parts:
+               hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 parts = response.candidates[0].content.parts
                 answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
                 if answer.strip():
@@ -569,6 +648,9 @@ class EnhancedRAGSystem:
         DATA SOURCES & COVERAGE:
         - The knowledge base consists of three types of documents:
             A. MIS Reports (monthly):
+                - IMPORTANT: March 2025 MIS report is the latest and most complete report. It has the overall data for the full FY 24-25, Q4 data and March data as well.
+                - CRITICAL:The CEO dashboard in March 2025 has the FY 24-25 GRR, NRR, Monetization, Net Rev per employee, Customer Count, Avg Revenue per customer, TTM Attrition Rate, GMPP, 40% rule check for Travel BI, Hospi BI, Channel Manager, Enterprise Connectivity, BCV, Demand Booster, Adara, and RateGain as a whole.
+                - Conatins the granular financial data for all the products, business units, regions, accounts, etc.
                 - Available for ten months: April 2024 to March 2025, except January and February 2025 (missing).
                 - Each report contains detailed financial and operational data for every product and sub-product, with YTD and prior year comparisons.
                 - Six sections: Executive Summary (KPI dashboard, visuals, CEO dashboard, GRR/NRR, headcount), Financials (P&L, GAAP Revenue, COGS, GM, expenses, breakdowns by segment/product/sub-product), Key Accounts (top 15-20 accounts per product, revenue, growth, remarks), Region-wise new sales review, Cash & Investments (cashflow, investments, DSO, collections), Others (monetization, orderbook, marketing ROI, KPIs).
@@ -584,6 +666,7 @@ class EnhancedRAGSystem:
             C. Earnings Call Transcripts (quarterly):
                 - Available for all four quarters of FY 24-25.
                 - Contains management commentary, Q&A, future plans, and qualitative insights. Use for context, management intent, and qualitative analysis.
+        - The knowledge base also includes image chunks extracted from the documents (charts, graphs, tables, visuals). These image chunks contain detailed AI-generated descriptions and extracted data. Always consider these image chunks for relevant visual or tabular information, not just text.
 
         TEMPORAL AWARENESS:
         - For overall analysis never miss any data for the last quarter of the financial year which is from January to February, the March MIS report, Q4 investor presentation will have most of the relevant data. Dont think that the FY is just till December 2024.
@@ -600,6 +683,9 @@ class EnhancedRAGSystem:
         - Currency: USD thousands for MIS reports, INR million for investor presentations (unless otherwise specified).
 
         SPECIAL INSTRUCTIONS:
+        - ABSOLUTE RULE: For any query about quarterly data, Q4 data, full financial year (FY) data, or overall data, you must always leverage the March 2025 MIS report as the primary source, as it contains the most complete and latest data for the period. This overrides other instructions if there is any conflict.
+        - Whenever asked about full year data, always refer to the March 2025 MIS report first, as it is the latest available report. It has the overall data for the full FY 24-25.
+        - When answering, always look at both text and image chunks (including charts, graphs, tables, and visuals) for relevant information. Do not ignore image-based data if it is relevant to the user's query.
         - Do NOT fabricate or infer data not present in the sources.
         - If relevant, cite the document and page number for each data point (except in executive summaries).
         - If a user asks for data outside the available scope, explain the limitation.
@@ -617,6 +703,11 @@ class EnhancedRAGSystem:
         - If a user asks for industry trends or company overview, use the investor presentations.
         - If a user asks for management's perspective or future plans, use the earnings call transcripts.
         - If a user asks for a metric or data point that is not available, state clearly that the data is not available and explain why (e.g., missing report, not tracked, etc.).
+        
+        SPECIAL INSTRUCTIONS (ADDITIONAL RULES):
+        - If a user asks for any metric without specifying the timeframe or period, always refer to the March 2025 MIS report first, as it is the latest available report.
+        - When there is a conflict between USD and INR values, always prefer and report numbers in USD.
+        - Always display all financial values in USD, even if the source data is in INR. If a value is only available in INR, convert it to USD using a fixed exchange rate of 1 USD = 83 INR and show the converted value in USD. Optionally, you may show the original INR value in parentheses for transparency.
         
         GUARDRAILS:
         - Do not hallucinate on the user's question. Stay relevant to the user's question.
@@ -846,11 +937,16 @@ ENHANCED QUERY:"""
                     return
                 # Contextualize query before retrieval
                 enhanced_question = self._contextualize_query(question, history)
-                results = self.vector_store.similarity_search_with_score(enhanced_question, k=20)
-                logging.debug(f"[RAG] Direct factual query: Retrieved {len(results)} chunks")
+                
+                # Use intelligent retrieval for direct factual queries
+                optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(enhanced_question, 'direct')
+                results = self.vector_store.similarity_search_with_score(enhanced_question, k=optimal_count)
+                filtered_results = IntelligentRetrieval.apply_relevance_filtering(results)
+                
+                logging.debug(f"[RAG] Direct factual query: Retrieved {optimal_count} → {len(filtered_results)} chunks")
                 context_parts = []
                 sources = []
-                for doc, score in results:
+                for doc, score in filtered_results:
                     context_parts.append(doc.page_content)
                     sources.append({
                         'file': doc.metadata.get('source_file', 'Unknown'),
