@@ -21,4 +21,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8501 8000
 
 # Default command (adjust if you use Streamlit/Chainlit UI)
-CMD ["chainlit", "run", "app_chain.py"] 
+CMD ["chainlit", "run", "app_chain.py", "--host", "10.221.2.236", "--port", "8000"] 

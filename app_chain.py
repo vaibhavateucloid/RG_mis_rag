@@ -12,7 +12,7 @@ rag_system = None
 
 # Constants for message handling
 MAX_MESSAGE_LENGTH = 50000  # Chainlit message length limit
-MAX_THINKING_LENGTH = 20000  # Limit accumulated thinking to prevent memory issues
+MAX_THINKING_LENGTH = 30000  # Limit accumulated thinking to prevent memory issues
  
 def initialize_rag():
     """Initialize the RAG system."""

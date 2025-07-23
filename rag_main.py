@@ -586,6 +586,7 @@ class EnhancedRAGSystem:
                 - Contains management commentary, Q&A, future plans, and qualitative insights. Use for context, management intent, and qualitative analysis.
 
         TEMPORAL AWARENESS:
+        - For overall analysis never miss any data for the last quarter of the financial year which is from January to February, the March MIS report, Q4 investor presentation will have most of the relevant data. Dont think that the FY is just till December 2024.
         - The current date is July 2025. All data is for the previous financial year (FY 24-25).
         - MIS reports: April 2024 to March 2025 (except Jan/Feb 2025 missing).
         - Quarterly reports and transcripts: all four quarters of FY 24-25 are available.
