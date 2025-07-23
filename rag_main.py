@@ -1,4 +1,4 @@
-# Enhanced RAG System with CFA Agent and Executive Agent - Optimized Retrieval
+# Enhanced RAG System with March PDF Prioritization - Optimized Retrieval
 
 import os
 import time
@@ -28,6 +28,198 @@ class QueryType(Enum):
     DIRECT_FACTUAL = "direct_factual"
     EXECUTIVE_ANALYTICAL = "executive_analytical"
     DEEP_ANALYTICAL = "deep_analytical"
+
+class MarchPDFRetrieval:
+    """Smart retrieval system that prioritizes March PDF for company-wide/FY queries."""
+    
+    @staticmethod
+    def is_company_wide_query(query: str) -> bool:
+        """Detect if query is asking for company-wide, quarterly, or FY data."""
+        query_lower = query.lower()
+        
+        # Company-wide indicators
+        company_indicators = [
+            'full company', 'entire company', 'overall company', 'company wide', 'company-wide',
+            'rategain', 'consolidated', 'overall', 'total', 'combined', 'aggregate',
+            'company as a whole', 'whole company', 'entire business', 'full business'
+        ]
+        
+        # Fiscal year indicators
+        fy_indicators = [
+            'fy 24-25', 'fy24-25', 'fy 2024-25', 'fy 2025', 'fiscal year 24-25',
+            'fiscal year 2024-25', 'fiscal year 2025', 'annual', 'yearly',
+            'full year', 'entire year', 'april 2024 to march 2025',
+            'april 2024 - march 2025', '12 months', 'full fiscal'
+        ]
+        
+        # Quarterly indicators
+        quarterly_indicators = [
+            'q1', 'q2', 'q3', 'q4', 'quarter', 'quarterly', 'q1 fy25', 'q2 fy25',
+            'q3 fy25', 'q4 fy25', 'first quarter', 'second quarter', 'third quarter',
+            'fourth quarter', 'quarter ended', 'quarterly results'
+        ]
+        
+        # Check for any indicators
+        all_indicators = company_indicators + fy_indicators + quarterly_indicators
+        return any(indicator in query_lower for indicator in all_indicators)
+    
+    @staticmethod
+    def prioritized_retrieval(vector_store, query: str, k: int = 15) -> List[Tuple]:
+        """
+        Hybrid retrieval that prioritizes March PDF for company-wide queries.
+        Returns list of (document, score) tuples.
+        """
+        results = []
+        
+        if MarchPDFRetrieval.is_company_wide_query(query):
+            logging.info(f"🎯 Company-wide query detected, prioritizing March PDF")
+            
+            # Step 1: Get March PDF chunks specifically
+            march_results = MarchPDFRetrieval._retrieve_from_march_pdf(vector_store, query, k=8)
+            results.extend(march_results)
+            logging.info(f"📊 Retrieved {len(march_results)} chunks from March PDF")
+            
+            # Step 2: Supplement with general search, avoiding duplicates
+            general_results = vector_store.similarity_search_with_score(query, k=k)
+            march_content = {doc.page_content for doc, _ in march_results}
+            
+            for doc, score in general_results:
+                if doc.page_content not in march_content and len(results) < k:
+                    results.append((doc, score))
+            
+            logging.info(f"📈 Total chunks after supplementing: {len(results)}")
+            
+        else:
+            # Regular semantic search for non-company-wide queries
+            results = vector_store.similarity_search_with_score(query, k=k)
+            logging.info(f"🔍 Regular semantic search: {len(results)} chunks")
+        
+        return results
+    
+    @staticmethod
+    def _retrieve_from_march_pdf(vector_store, query: str, k: int = 8) -> List[Tuple]:
+        """Retrieve chunks specifically from March PDF."""
+        try:
+            # Get all documents first with a larger k to find March PDF content
+            all_results = vector_store.similarity_search_with_score(query, k=50)
+            
+            # Filter for March PDF documents
+            march_results = []
+            for doc, score in all_results:
+                source_file = doc.metadata.get('source_file', '').lower()
+                if 'march' in source_file or 'mar' in source_file:
+                    march_results.append((doc, score))
+                    if len(march_results) >= k:
+                        break
+            
+            # If no March-specific files found, look for recent MIS files
+            if not march_results:
+                for doc, score in all_results:
+                    source_file = doc.metadata.get('source_file', '').lower()
+                    if 'mis' in source_file and any(month in source_file for month in ['march', 'mar', '03']):
+                        march_results.append((doc, score))
+                        if len(march_results) >= k:
+                            break
+            
+            return march_results
+            
+        except Exception as e:
+            logging.error(f"Error retrieving from March PDF: {e}")
+            return []
+
+class IntelligentRetrieval:
+    """Enhanced intelligent retrieval with March PDF prioritization."""
+    
+    @staticmethod
+    def classify_subquery_complexity(sub_query: str) -> str:
+        """Classify sub-query complexity for optimal retrieval count."""
+        query_lower = sub_query.lower()
+        
+        # Complex multi-dimensional queries
+        complex_keywords = ['root cause', 'analyze', 'comprehensive', 'detailed analysis', 'drivers', 'trends', 'compare multiple', 'breakdown']
+        if any(keyword in query_lower for keyword in complex_keywords):
+            return 'complex'
+        
+        # Comparative queries
+        comparative_keywords = ['compare', 'vs', 'versus', 'difference', 'contrast', 'relative']
+        if any(keyword in query_lower for keyword in comparative_keywords):
+            return 'comparative'
+        
+        # Simple factual queries
+        simple_keywords = ['what was', 'what is', 'how much', 'show', 'list', 'value of', 'amount']
+        if any(keyword in query_lower for keyword in simple_keywords):
+            return 'simple'
+        
+        # Default to moderate complexity
+        return 'moderate'
+    
+    @staticmethod
+    def get_optimal_retrieval_count(sub_query: str, query_type: str = 'moderate') -> int:
+        """Get optimal initial retrieval count based on query characteristics."""
+        complexity = IntelligentRetrieval.classify_subquery_complexity(sub_query)
+        
+        # Increase retrieval counts for better coverage
+        retrieval_map = {
+            'simple': 8,
+            'moderate': 12,
+            'comparative': 15,
+            'complex': 18
+        }
+        
+        return retrieval_map.get(complexity, 12)
+    
+    @staticmethod
+    def apply_relevance_filtering(results: List[Tuple], min_score: float = 0.2, score_drop_threshold: float = 0.2) -> List[Tuple]:
+        """Apply intelligent relevance filtering with relaxed thresholds."""
+        if not results:
+            return results
+        
+        filtered_results = []
+        prev_score = None
+        
+        for doc, score in results:
+            # Always include first few results if they meet minimum threshold
+            if len(filtered_results) < 5 and score >= min_score:
+                filtered_results.append((doc, score))
+                prev_score = score
+                continue
+            
+            # Stop if score drops significantly
+            if prev_score and (prev_score - score) > score_drop_threshold:
+                break
+            
+            # Stop if score is too low
+            if score < min_score:
+                break
+            
+            filtered_results.append((doc, score))
+            prev_score = score
+            
+            # Cap at reasonable maximum
+            if len(filtered_results) >= 20:
+                break
+        
+        # Ensure minimum results for complex queries
+        if len(filtered_results) < 5 and len(results) >= 5:
+            return results[:5]
+        
+        return filtered_results
+    
+    @staticmethod
+    def enhanced_retrieve(vector_store, query: str, max_chunks: int = 20) -> List[Tuple]:
+        """Enhanced retrieval using March PDF prioritization."""
+        # Get optimal initial count
+        optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(query)
+        initial_count = min(optimal_count, max_chunks)
+        
+        # Use prioritized retrieval
+        results = MarchPDFRetrieval.prioritized_retrieval(vector_store, query, k=initial_count)
+        
+        # Apply relaxed relevance filtering
+        filtered_results = IntelligentRetrieval.apply_relevance_filtering(results)
+        
+        logging.info(f"Enhanced retrieval: {len(results)} → {len(filtered_results)} chunks for query: {query[:50]}...")
+        return filtered_results
 
 class GeminiEmbeddings:
     """Custom embeddings class that uses Google Gemini embedding models."""
@@ -83,117 +275,11 @@ class GeminiEmbeddings:
             raise ValueError("Gemini client not loaded")
         return self._embed_with_retry(text)
 
-class IntelligentRetrieval:
-    """Intelligent retrieval optimization for vector search operations."""
-    
-    @staticmethod
-    def classify_subquery_complexity(sub_query: str) -> str:
-        """Classify sub-query complexity for optimal retrieval count."""
-        query_lower = sub_query.lower()
-        
-        # Complex multi-dimensional queries
-        complex_keywords = ['root cause', 'analyze', 'comprehensive', 'detailed analysis', 'drivers', 'trends', 'compare multiple', 'breakdown']
-        if any(keyword in query_lower for keyword in complex_keywords):
-            return 'complex'
-        
-        # Comparative queries
-        comparative_keywords = ['compare', 'vs', 'versus', 'difference', 'contrast', 'relative']
-        if any(keyword in query_lower for keyword in comparative_keywords):
-            return 'comparative'
-        
-        # Simple factual queries
-        simple_keywords = ['what was', 'what is', 'how much', 'show', 'list', 'value of', 'amount']
-        if any(keyword in query_lower for keyword in simple_keywords):
-            return 'simple'
-        
-        # Default to moderate complexity
-        return 'moderate'
-    
-    @staticmethod
-    def get_optimal_retrieval_count(sub_query: str, query_type: str = 'moderate') -> int:
-        """Get optimal initial retrieval count based on query characteristics."""
-        complexity = IntelligentRetrieval.classify_subquery_complexity(sub_query)
-        
-        retrieval_map = {
-            'simple': 5,
-            'moderate': 8,
-            'comparative': 10,
-            'complex': 12
-        }
-        
-        return retrieval_map.get(complexity, 8)
-    
-    @staticmethod
-    def apply_relevance_filtering(results: List[Tuple], min_score: float = 0.3, score_drop_threshold: float = 0.15) -> List[Tuple]:
-        """Apply intelligent relevance filtering to search results."""
-        if not results:
-            return results
-        
-        filtered_results = []
-        prev_score = None
-        
-        for doc, score in results:
-            # Always include first few results if they meet minimum threshold
-            if len(filtered_results) < 3 and score >= min_score:
-                filtered_results.append((doc, score))
-                prev_score = score
-                continue
-            
-            # Stop if score drops significantly
-            if prev_score and (prev_score - score) > score_drop_threshold:
-                break
-            
-            # Stop if score is too low
-            if score < min_score:
-                break
-            
-            filtered_results.append((doc, score))
-            prev_score = score
-            
-            # Cap at reasonable maximum
-            if len(filtered_results) >= 15:
-                break
-        
-        # Ensure minimum results for complex queries
-        if len(filtered_results) < 3 and len(results) >= 3:
-            return results[:3]
-        
-        return filtered_results
-    
-    @staticmethod
-    def detect_content_sufficiency(chunks: List[str], sub_query: str) -> bool:
-        """Detect if retrieved content is sufficient for the sub-query."""
-        if len(chunks) < 2:
-            return False
-        
-        # Simple heuristic: check for key terms coverage
-        query_lower = sub_query.lower()
-        key_terms = []
-        
-        # Extract potential key terms from query
-        financial_terms = ['revenue', 'ebitda', 'cost', 'profit', 'nrr', 'grr', 'retention', 'growth']
-        time_terms = ['q1', 'q2', 'q3', 'q4', 'january', 'february', 'march', 'april', 'may', 'june',
-                     'july', 'august', 'september', 'october', 'november', 'december', '2024', '2025']
-        product_terms = ['hospi bi', 'travel bi', 'daas', 'distribution', 'martech', 'connectivity']
-        
-        for term_list in [financial_terms, time_terms, product_terms]:
-            key_terms.extend([term for term in term_list if term in query_lower])
-        
-        if not key_terms:
-            return len(chunks) >= 5  # Default sufficiency for non-specific queries
-        
-        # Check coverage of key terms in retrieved content
-        combined_content = ' '.join(chunks).lower()
-        covered_terms = sum(1 for term in key_terms if term in combined_content)
-        coverage_ratio = covered_terms / len(key_terms) if key_terms else 0
-        
-        return coverage_ratio >= 0.7 and len(chunks) >= 3
-
 class QueryClassifier:
     """Classifies queries as direct factual, executive analytical, or deep analytical."""
     
     def __init__(self, genai_client=None):
-        self.conversation_history = deque(maxlen=5)  # Track last 5 turns
+        self.conversation_history = deque(maxlen=5)
         self.genai_client = genai_client
     
     def add_to_history(self, query: str, response_type: str):
@@ -207,6 +293,7 @@ class QueryClassifier:
     def classify_query(self, query: str) -> QueryType:
         """Classify the query type using Gemini-2.5-Flash if available, else fallback to robust keyword logic."""
         query_lower = query.lower()
+        
         # Try LLM-based classification if client is available
         if self.genai_client is not None:
             try:
@@ -229,6 +316,7 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
                     }
                 )
                 if response and hasattr(response, "candidates") and response.candidates and \
+                   response.candidates[0] is not None and \
                    hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                    hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                     label = response.candidates[0].content.parts[0].text.strip().lower()
@@ -240,8 +328,8 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
                         return QueryType.DEEP_ANALYTICAL
             except Exception as e:
                 logging.warning(f"[QueryClassifier] LLM classification failed, falling back to keyword logic: {e}")
+        
         # Fallback: robust keyword-based logic
-        # 1. Deep Analytical: root cause, why, drivers, analysis, etc.
         deep_analysis_keywords = [
             'root cause', 'why', 'explain', 'driver', 'reason', 'cause', 'deep analysis', 'detailed analysis',
             'elaborate', 'breakdown', 'comprehensive analysis', 'in-depth', 'thorough', 'analyze', 'analyse',
@@ -249,7 +337,7 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
         ]
         if any(kw in query_lower for kw in deep_analysis_keywords):
             return QueryType.DEEP_ANALYTICAL
-        # 2. Executive Analytical: summary, overview, compare, trend, performance, insight, high level, etc.
+        
         executive_keywords = [
             'summary', 'summarize', 'overview', 'insight', 'compare', 'comparison', 'trend', 'performance',
             'high level', 'business impact', 'implication', 'implications', 'key findings', 'key insights',
@@ -258,7 +346,7 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
         ]
         if any(kw in query_lower for kw in executive_keywords):
             return QueryType.EXECUTIVE_ANALYTICAL
-        # 3. Direct Factual: must contain metric/number keywords and NOT contain summary/analysis words
+        
         metric_keywords = [
             'revenue', 'ebitda', 'cost', 'costs', 'profit', 'loss', 'nrr', 'grr', 'retention', 'monetization',
             'department spending', 'sales', 'ltv', 'cogs', 'cashflow', 'cash flow', 'collection', 'accounts',
@@ -268,10 +356,10 @@ Respond with only one of: direct_factual, executive_analytical, deep_analytical.
             'as of', 'for', 'in', 'during', 'between', 'show', 'list', 'give', 'provide', 'display', 'report', 'state',
             'what is', 'what was', 'how many', 'how much', 'when', 'which', 'find', 'identify', 'fetch', 'extract'
         ]
-        # Exclude if summary/analysis words present
+        
         if any(kw in query_lower for kw in metric_keywords) and not any(kw in query_lower for kw in executive_keywords + deep_analysis_keywords):
             return QueryType.DIRECT_FACTUAL
-        # Default: executive analytical (catch-all for high-level)
+        
         return QueryType.EXECUTIVE_ANALYTICAL
 
 class ExecutiveAgent:
@@ -284,32 +372,19 @@ class ExecutiveAgent:
         self._call_llm_with_fallback = llm_fallback_fn
     
     def _intelligent_retrieve(self, query: str, max_chunks: int = 20) -> List[Tuple]:
-        """Perform intelligent retrieval with relevance filtering."""
-        # Get optimal initial count
-        optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(query, 'executive')
-        initial_count = min(optimal_count, max_chunks)
-        
-        # Retrieve initial results
-        results = self.vector_store.similarity_search_with_score(query, k=initial_count)
-        
-        # Apply relevance filtering
-        filtered_results = IntelligentRetrieval.apply_relevance_filtering(results)
-        
-        logging.info(f"Executive retrieval: {len(results)} → {len(filtered_results)} chunks for query: {query[:50]}...")
-        return filtered_results
+        """Use enhanced retrieval with March PDF prioritization."""
+        return IntelligentRetrieval.enhanced_retrieve(self.vector_store, query, max_chunks)
     
     async def analyze_executive_summary(self, query: str, context: str = "", original_query: str = None, chat_history: list = None) -> typing.AsyncGenerator[Dict, None]:
         """Perform executive-level analysis with concise insights."""
         import asyncio
         
-        # Do not yield thinking steps for executive agent, only yield the final answer
         try:
-            # Contextualize query before retrieval if chat history provided
             enhanced_query = query
             if chat_history and hasattr(self, '_parent_system'):
                 enhanced_query = self._parent_system._contextualize_query(original_query or query, chat_history)
             
-            # Use intelligent retrieval
+            # Use enhanced retrieval
             results = self._intelligent_retrieve(enhanced_query)
             
             # Prepare context from retrieved data
@@ -450,7 +525,7 @@ Return sub-queries only, one per line, no numbering."""
                hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 sub_queries_text = response.candidates[0].content.parts[0].text
                 sub_queries = [q.strip() for q in sub_queries_text.split('\n') if q.strip()]
-                return sub_queries[:8]  # Limit to 8 sub-queries
+                return sub_queries[:8]
             return []
         except Exception as e:
             logging.error(f"Error generating sub-queries: {e}")
@@ -467,19 +542,13 @@ class CFAAgent:
         self.sub_query_generator = SubQueryGenerator(genai_client, llm_fallback_fn)
     
     def _intelligent_retrieve(self, sub_query: str) -> List[Dict]:
-        """Perform intelligent retrieval for a sub-query."""
-        # Get optimal retrieval count
-        optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(sub_query, 'cfa')
-        
-        # Retrieve with optimal count
-        results = self.vector_store.similarity_search_with_score(sub_query, k=optimal_count)
-        
-        # Apply relevance filtering
-        filtered_results = IntelligentRetrieval.apply_relevance_filtering(results, min_score=0.25)
+        """Use enhanced retrieval for a sub-query."""
+        # Use enhanced retrieval
+        results = IntelligentRetrieval.enhanced_retrieve(self.vector_store, sub_query)
         
         # Convert to chunk data format
         chunk_data_list = []
-        for doc, score in filtered_results:
+        for doc, score in results:
             chunk_data = {
                 'content': doc.page_content,
                 'score': score,
@@ -488,7 +557,7 @@ class CFAAgent:
             }
             chunk_data_list.append(chunk_data)
         
-        logging.info(f"CFA retrieval: {len(results)} → {len(filtered_results)} chunks for sub-query: {sub_query[:50]}...")
+        logging.info(f"CFA enhanced retrieval: {len(results)} chunks for sub-query: {sub_query[:50]}...")
         return chunk_data_list
     
     async def analyze_with_thinking(self, query: str, context: str = "", original_query: str = None, chat_history: list = None) -> typing.AsyncGenerator[Dict, None]:
@@ -513,13 +582,13 @@ class CFAAgent:
             yield {"type": "thinking", "content": f"• {sq}"}
             await asyncio.sleep(0)
 
-        # --- Parallelize retrieval for all sub-queries using asyncio.gather ---
+        # Parallelize retrieval for all sub-queries using asyncio.gather
         async def retrieve_chunks(sub_query):
             enhanced_sub_query = sub_query
             if chat_history and hasattr(self, '_parent_system'):
                 enhanced_sub_query = self._parent_system._contextualize_query(sub_query, chat_history)
             
-            # Use intelligent retrieval
+            # Use enhanced retrieval
             loop = asyncio.get_event_loop()
             chunk_data_list = await loop.run_in_executor(None, self._intelligent_retrieve, enhanced_sub_query)
             
@@ -529,7 +598,6 @@ class CFAAgent:
         # Launch all retrievals in parallel
         all_retrieved_lists = await asyncio.gather(*(retrieve_chunks(sq) for sq in sub_queries))
         all_retrieved_data = [item for sublist in all_retrieved_lists for item in sublist]
-        # --- End parallelization ---
 
         unique_data = []
         seen_content = set()
@@ -582,6 +650,7 @@ REQUIREMENTS:
 • Include segment/product-level analysis when relevant
 • Focus on actionable business insights
 • Professional CFA-level analysis depth
+• You can be witty and sarcastic in your analysis, but always be professional and data-driven.
 
 ANALYSIS:"""
 
@@ -628,10 +697,10 @@ ANALYSIS:"""
                 })
                 seen_sources.add(source_key)
         
-        return sorted(sources, key=lambda x: x['score'])[:10]  # Top 10 sources
+        return sorted(sources, key=lambda x: x['score'])[:10]
 
 class EnhancedRAGSystem:
-    """Enhanced RAG system with executive agent, CFA agent and intelligent query routing."""
+    """Enhanced RAG system with March PDF prioritization and intelligent query routing."""
     SYSTEM_PROMPT = (
         """
         SYSTEM INSTRUCTIONS:
@@ -737,7 +806,7 @@ class EnhancedRAGSystem:
         self.cfa_agent = None
         self.executive_agent = None
         self.query_classifier = QueryClassifier()
-        self.conversation_history = []  # Store full chat history as list of dicts
+        self.conversation_history = []
         
         self._setup_system()
     
@@ -766,7 +835,7 @@ class EnhancedRAGSystem:
     
     def _setup_system(self):
         """Initialize enhanced RAG system."""
-        logging.info("🚀 Initializing Enhanced RAG System with Executive Agent...")
+        logging.info("🚀 Initializing Enhanced RAG System with March PDF Prioritization...")
         
         # Check if vector store exists
         if not self._check_vector_store_exists():
@@ -820,7 +889,7 @@ class EnhancedRAGSystem:
                     logging.info(f"✅ Generation model initialized: {self.generation_model} (secondary key)")
                 except Exception as e2:
                     logging.error(f"❌ Failed to initialize generation model with secondary key: {str(e2)}")
-            # Use primary as default for compatibility
+            
             self.genai_client = self.genai_client_primary or self.genai_client_secondary
             if not self.genai_client:
                 logging.error("❌ No valid Gemini client could be initialized.")
@@ -833,26 +902,20 @@ class EnhancedRAGSystem:
         self.cfa_agent = CFAAgent(self.vector_store, self.embeddings, self.genai_client, self._call_llm_with_fallback)
         self.executive_agent = ExecutiveAgent(self.vector_store, self.embeddings, self.genai_client, self._call_llm_with_fallback)
         self.query_classifier = QueryClassifier(genai_client=self.genai_client)
-        self.conversation_history = []  # Store full chat history as list of dicts
+        self.conversation_history = []
+        
         # Add parent system reference to agents
         self.cfa_agent._parent_system = self
         self.executive_agent._parent_system = self
         logging.info("✅ CFA Agent and Executive Agent initialized")
-        logging.info("✅ Enhanced RAG System ready!")
+        logging.info("✅ Enhanced RAG System with March PDF Prioritization ready!")
 
     def _contextualize_query(self, original_query: str, chat_history: list) -> str:
-        """
-        Contextualize query using chat history for better retrieval.
-        Always uses last 4 messages to decide and enhance if needed.
-        Leverage the LLM to infer and retain time period and entity context, without hardcoded extraction.
-        """
-        # Skip if no meaningful history
+        """Contextualize query using chat history for better retrieval."""
         if not chat_history or len(chat_history) < 2:
             return original_query
         try:
-            # Extract recent conversation (last 4 messages)
             recent_history = chat_history[-4:] if len(chat_history) > 4 else chat_history
-            # Build conversation context
             context_parts = []
             for msg in recent_history:
                 if msg.get("role") in ["user", "assistant"]:
@@ -862,7 +925,6 @@ class EnhancedRAGSystem:
                     context_parts.append(f"{msg['role']}: {content}")
             recent_context = "\n".join(context_parts)
 
-            # LLM prompt: let the LLM infer and retain time period/entity context
             contextualization_prompt = f"""You are a query enhancement assistant. Your job is to make the user's question self-contained for retrieval, by inferring and retaining any relevant time period (month, quarter, year, fiscal year) and entity (segment, product, sub-product, region, account, etc.) from the conversation history and the current question.
 
 CONVERSATION HISTORY:
@@ -890,7 +952,6 @@ ENHANCED QUERY:"""
                hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
                hasattr(response.candidates[0].content, "parts") and response.candidates[0].content.parts:
                 enhanced_query = response.candidates[0].content.parts[0].text.strip()
-                # Use enhanced query if it's different and reasonable
                 if 10 <= len(enhanced_query) <= 500 and enhanced_query != original_query:
                     logging.info(f"🔄 Query contextualized: '{original_query}' → '{enhanced_query}'")
                     return enhanced_query
@@ -909,17 +970,17 @@ ENHANCED QUERY:"""
         return "\n".join(context_lines)
 
     async def query(self, question: str, history: list) -> typing.AsyncGenerator[dict, None]:
-        """Process query with intelligent routing as an async generator. Accepts external chat history."""
-        logging.debug(f"[RAG] query() called with question: {question!r}, history type: {type(history)}, history: {history}")
+        """Process query with intelligent routing and March PDF prioritization."""
+        logging.debug(f"[RAG] query() called with question: {question!r}")
         if not self.is_ready():
             logging.error("[RAG] System not ready, yielding error.")
             yield {"type": "error", "content": "❌ RAG system not ready"}
             return
+        
         # Build full context from provided history
         full_context = self._build_context_from_history(history)
-        logging.debug(f"[RAG] Built full_context: {full_context!r}")
-        # Prepend system prompt to context for all LLM calls
         system_context = f"{self.SYSTEM_PROMPT}\n\n{full_context}" if full_context else self.SYSTEM_PROMPT
+        
         # Classify query type
         query_type = self.query_classifier.classify_query(question)
         logging.info(f"[RAG] Query type classified as {query_type.name}")
@@ -929,32 +990,34 @@ ENHANCED QUERY:"""
             try:
                 yield {"type": "thinking", "content": "📊 **Direct Factual Query Mode**"}
                 yield {"type": "thinking", "content": "🔎 **Fetching data...**"}
+                
                 if self.vector_store is None:
                     yield {"type": "error", "content": "❌ Vector store is not initialized."}
                     return
                 if self.genai_client is None:
                     yield {"type": "error", "content": "❌ Gemini client is not initialized."}
                     return
+                
                 # Contextualize query before retrieval
                 enhanced_question = self._contextualize_query(question, history)
                 
-                # Use intelligent retrieval for direct factual queries
-                optimal_count = IntelligentRetrieval.get_optimal_retrieval_count(enhanced_question, 'direct')
-                results = self.vector_store.similarity_search_with_score(enhanced_question, k=optimal_count)
-                filtered_results = IntelligentRetrieval.apply_relevance_filtering(results)
+                # Use enhanced retrieval with March PDF prioritization
+                results = IntelligentRetrieval.enhanced_retrieve(self.vector_store, enhanced_question)
                 
-                logging.debug(f"[RAG] Direct factual query: Retrieved {optimal_count} → {len(filtered_results)} chunks")
+                logging.debug(f"[RAG] Direct factual query: Retrieved {len(results)} chunks")
                 context_parts = []
                 sources = []
-                for doc, score in filtered_results:
+                for doc, score in results:
                     context_parts.append(doc.page_content)
                     sources.append({
                         'file': doc.metadata.get('source_file', 'Unknown'),
                         'page': doc.metadata.get('page', 'Unknown'),
                         'score': score
                     })
+                
                 full_context_data = "\n".join(context_parts)
                 prompt = f"""{self.SYSTEM_PROMPT}\n\nYou are a financial analyst assistant for RateGain Travel Technologies. Answer the user's question directly based on the provided RateGain financial data.\n\nCONVERSATION CONTEXT:\n{system_context}\n\nFINANCIAL DATA:\n{full_context_data}\n\nUSER QUESTION: {question}\n\nIMPORTANT:\n- Only use information present in the provided sources.\n- Do not make up or infer data that is not explicitly present.\n- Provide a direct, accurate answer with specific numbers. Be concise but complete.\n- Do not include inline source citations."""
+                
                 try:
                     response = self._call_llm_with_fallback(
                         model=self.generation_model,
@@ -962,11 +1025,13 @@ ENHANCED QUERY:"""
                         config={'temperature': 0.1, 'max_output_tokens': 10000}
                     )
                 except Exception as e:
-                    logging.error(f"Error generating direct factual answer (both keys failed): {e}")
+                    logging.error(f"Error generating direct factual answer: {e}")
                     yield {"type": "error", "content": f"❌ Error processing query: {str(e)}"}
                     return
+                
                 yield {"type": "thinking", "content": "✅ **Data fetched!** (step 1/1)"}
                 yield {"type": "thinking", "content": "📤 **Ready to share the data**"}
+                
                 if response and hasattr(response, "candidates") and response.candidates and \
                    response.candidates[0] is not None and \
                    hasattr(response.candidates[0], "content") and response.candidates[0].content is not None and \
@@ -974,15 +1039,13 @@ ENHANCED QUERY:"""
                     parts = response.candidates[0].content.parts
                     answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
                     if answer.strip():
-                        logging.debug("[RAG] Direct factual query: Answer generated successfully, yielding answer.")
+                        logging.debug("[RAG] Direct factual query: Answer generated successfully")
                         yield {"type": "answer", "content": answer, "sources": sources[:5]}
                     else:
                         logging.warning(f"LLM returned no answer text. Full response: {response}")
                         yield {"type": "error", "content": "❌ Unable to generate response"}
                 else:
                     logging.error(f"[RAG] Direct factual query: Unexpected response: {response}")
-                    if response and hasattr(response, "candidates") and response.candidates and response.candidates[0] is not None and hasattr(response.candidates[0], "content"):
-                        logging.debug(f"[RAG] candidates[0].content: {response.candidates[0].content}")
                     yield {"type": "error", "content": "❌ Unable to generate response"}
             except Exception as e:
                 logging.error(f"[RAG] Error processing direct factual query: {str(e)}")
@@ -996,10 +1059,9 @@ ENHANCED QUERY:"""
                 yield {"type": "error", "content": "❌ Executive agent is not initialized."}
                 return
             async for item in self.executive_agent.analyze_executive_summary(question, system_context, question, history):
-                logging.debug(f"[RAG] Yielding executive agent item: {item}")
                 if item["type"] == "answer":
                     yield {"type": "thinking", "content": "✅ **Summary compiled!** (step 1/1)"}
-                    yield {"type": "thinking", "content": "📤 **Ready to share executive insights"}
+                    yield {"type": "thinking", "content": "📤 **Ready to share executive insights**"}
                     yield item
             self.query_classifier.add_to_history(question, 'executive_analytical')
         
@@ -1009,10 +1071,8 @@ ENHANCED QUERY:"""
                 yield {"type": "error", "content": "❌ CFA agent is not initialized."}
                 return
             async for item in self.cfa_agent.analyze_with_thinking(question, system_context, question, history):
-                logging.debug(f"[RAG] Yielding CFA agent item: {item}")
                 yield item
             self.query_classifier.add_to_history(question, 'deep_analytical')
-        logging.debug("[RAG] query() exiting.")
     
     def is_ready(self) -> bool:
         """Check if the enhanced RAG system is ready."""
@@ -1024,9 +1084,8 @@ ENHANCED QUERY:"""
             self.executive_agent is not None
         ])
 
-    # Utility function for robust LLM call with per-request fallback
     def _call_llm_with_fallback(self, model, contents, config):
-        """Try primary Gemini client, fallback to secondary if needed, including on None/empty answer. Log all key/model switches and empty answers."""
+        """Try primary Gemini client, fallback to secondary if needed."""
         error_types = ["503", "429", "401", "UNAVAILABLE", "overload", "quota", "rate limit"]
         def extract_answer(response):
             if response and hasattr(response, "candidates") and response.candidates and \
@@ -1037,7 +1096,7 @@ ENHANCED QUERY:"""
                 answer = ''.join([p.text for p in parts if hasattr(p, 'text') and p.text])
                 return answer.strip(), response
             return None, response
-        # Try all (key, model) combinations: (primary, pro), (primary, flash), (secondary, pro), (secondary, flash)
+        
         tried = []
         for key_name, client in [("primary", self.genai_client_primary), ("secondary", self.genai_client_secondary)]:
             if not client:
@@ -1046,8 +1105,7 @@ ENHANCED QUERY:"""
                 if not model_name:
                     continue
                 try:
-                    log_msg = f"Trying Gemini {model_name} with {key_name} key."
-                    logging.info(log_msg)
+                    logging.info(f"Trying Gemini {model_name} with {key_name} key.")
                     response = client.models.generate_content(
                         model=model_name,
                         contents=contents,
@@ -1058,7 +1116,7 @@ ENHANCED QUERY:"""
                         logging.info(f"Gemini {model_name} with {key_name} key succeeded.")
                         return response
                     else:
-                        logging.warning(f"Gemini {model_name} with {key_name} key returned None/empty answer. Full response: {resp_obj}")
+                        logging.warning(f"Gemini {model_name} with {key_name} key returned None/empty answer.")
                         tried.append((key_name, model_name, "empty"))
                 except Exception as e:
                     if any(err in str(e).upper() for err in error_types):
@@ -1067,8 +1125,8 @@ ENHANCED QUERY:"""
                     else:
                         logging.error(f"Gemini {model_name} with {key_name} key error: {e}")
                         raise
-        logging.error(f"All Gemini key/model combinations failed or returned empty. Tried: {tried}")
-        raise RuntimeError(f"No valid Gemini client/model available for LLM call, or all returned empty/None answer. Tried: {tried}")
+        logging.error(f"All Gemini key/model combinations failed. Tried: {tried}")
+        raise RuntimeError(f"No valid Gemini client/model available for LLM call. Tried: {tried}")
 
 # Alias for compatibility
 RAGSystem = EnhancedRAGSystem
@@ -1081,24 +1139,22 @@ def main():
         logging.error("❌ Enhanced RAG system initialization failed!")
         return
     
-    # Test queries
+    # Test queries focusing on company-wide/FY data
     test_queries = [
-        "What was the GAAP revenue for Hospi BI in August 2024?",  # Direct
-        "Compare the EBITDA for Hospi BI and Travel BI in Q2 and Q3",  # Executive
-        "Analyze further the EBITDA trends for Hospi BI"  # Deep (follow-up)
+        "What was the overall revenue for RateGain in FY 24-25?",  # Company-wide
+        "Show me the quarterly EBITDA performance",  # Quarterly
+        "Analyze the full company performance trends"  # Deep analytical
     ]
     
-    logging.info("\n🧪 Testing Enhanced RAG System...")
+    logging.info("\n🧪 Testing Enhanced RAG System with March PDF Prioritization...")
     for query in test_queries:
         logging.info(f"\n{'='*50}")
         logging.info(f"QUERY: {query}")
         logging.info('='*50)
         
-        # Use regular for loop since main() is not async
         import asyncio
         async def run_query():
-            # Create a dummy history for testing
-            dummy_history = [{"role": "user", "content": "Hello, I'm a user."}]
+            dummy_history = [{"role": "user", "content": "Hello, I'm analyzing RateGain's performance."}]
             async for response in rag_system.query(query, dummy_history):
                 if response["type"] == "thinking":
                     logging.info(response["content"])
