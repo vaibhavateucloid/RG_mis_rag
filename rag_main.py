@@ -29,6 +29,45 @@ class QueryType(Enum):
     EXECUTIVE_ANALYTICAL = "executive_analytical"
     DEEP_ANALYTICAL = "deep_analytical"
 
+MONTHS = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+    'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+]
+
+MONTH_MAP = {
+    'jan': 'january', 'feb': 'february', 'mar': 'march', 'apr': 'april',
+    'may': 'may', 'jun': 'june', 'jul': 'july', 'aug': 'august',
+    'sep': 'september', 'oct': 'october', 'nov': 'november', 'dec': 'december'
+}
+
+def extract_months_from_query(query: str):
+    query_lower = query.lower()
+    found_months = set()
+    for m in MONTHS:
+        # match as word boundary
+        if re.search(r'\b' + re.escape(m) + r'\b', query_lower):
+            found_months.add(MONTH_MAP.get(m, m))
+    return list(found_months)
+
+class MonthPDFRetrieval:
+    @staticmethod
+    def retrieve_from_month_pdf(vector_store, query: str, month: str, k: int = 8):
+        """Retrieve up to k chunks from the PDF for the given month."""
+        try:
+            all_results = vector_store.similarity_search_with_score(query, k=50)
+            month_results = []
+            for doc, score in all_results:
+                source_file = doc.metadata.get('source_file', '').lower()
+                if month in source_file:
+                    month_results.append((doc, score))
+                    if len(month_results) >= k:
+                        break
+            return month_results
+        except Exception as e:
+            logging.error(f"Error retrieving from {month} PDF: {e}")
+            return []
+
 class MarchPDFRetrieval:
     """Smart retrieval system that prioritizes March PDF for company-wide/FY queries."""
     
@@ -69,31 +108,27 @@ class MarchPDFRetrieval:
         Hybrid retrieval that prioritizes March PDF for company-wide queries.
         Returns list of (document, score) tuples.
         """
+        months = extract_months_from_query(query)
         results = []
-        
-        if MarchPDFRetrieval.is_company_wide_query(query):
-            logging.info(f"🎯 Company-wide query detected, prioritizing March PDF")
-            
-            # Step 1: Get March PDF chunks specifically
-            march_results = MarchPDFRetrieval._retrieve_from_march_pdf(vector_store, query, k=8)
-            results.extend(march_results)
-            logging.info(f"📊 Retrieved {len(march_results)} chunks from March PDF")
-            
-            # Step 2: Supplement with general search, avoiding duplicates
-            general_results = vector_store.similarity_search_with_score(query, k=k)
-            march_content = {doc.page_content for doc, _ in march_results}
-            
+        if months:
+            logging.info(f"📅 Month(s) detected in query: {months}, prioritizing month PDFs")
+            # Step 1: Get up to 8 chunks from each month
+            month_content = set()
+            for month in months:
+                month_chunks = MonthPDFRetrieval.retrieve_from_month_pdf(vector_store, query, month, k=8)
+                for doc, score in month_chunks:
+                    if doc.page_content not in month_content:
+                        results.append((doc, score))
+                        month_content.add(doc.page_content)
+            # Step 2: Supplement with 8 general chunks
+            general_results = vector_store.similarity_search_with_score(query, k=16)
             for doc, score in general_results:
-                if doc.page_content not in march_content and len(results) < k:
+                if doc.page_content not in month_content and len(results) < (len(months)*8 + 8):
                     results.append((doc, score))
-            
-            logging.info(f"📈 Total chunks after supplementing: {len(results)}")
-            
+            logging.info(f"📈 Total chunks after month prioritization: {len(results)}")
         else:
-            # Regular semantic search for non-company-wide queries
-            results = vector_store.similarity_search_with_score(query, k=k)
-            logging.info(f"🔍 Regular semantic search: {len(results)} chunks")
-        
+            # Fallback to company-wide/March prioritization or regular
+            results = MarchPDFRetrieval._prioritized_or_regular(vector_store, query, k)
         return results
     
     @staticmethod
@@ -126,6 +161,24 @@ class MarchPDFRetrieval:
         except Exception as e:
             logging.error(f"Error retrieving from March PDF: {e}")
             return []
+
+    @staticmethod
+    def _prioritized_or_regular(vector_store, query: str, k: int = 15) -> List[Tuple]:
+        # Existing logic for company-wide/March prioritization
+        if MarchPDFRetrieval.is_company_wide_query(query):
+            logging.info(f"🎯 Company-wide query detected, prioritizing March PDF")
+            march_results = MarchPDFRetrieval._retrieve_from_march_pdf(vector_store, query, k=8)
+            results = list(march_results)
+            march_content = {doc.page_content for doc, _ in march_results}
+            general_results = vector_store.similarity_search_with_score(query, k=k)
+            for doc, score in general_results:
+                if doc.page_content not in march_content and len(results) < k:
+                    results.append((doc, score))
+            return results
+        else:
+            results = vector_store.similarity_search_with_score(query, k=k)
+            logging.info(f"🔍 Regular semantic search: {len(results)} chunks")
+            return results
 
 class IntelligentRetrieval:
     """Enhanced intelligent retrieval with March PDF prioritization."""
@@ -778,6 +831,23 @@ class EnhancedRAGSystem:
         - When there is a conflict between USD and INR values, always prefer and report numbers in USD.
         - Always display all financial values in USD, even if the source data is in INR. If a value is only available in INR, convert it to USD using a fixed exchange rate of 1 USD = 83 INR and show the converted value in USD. Optionally, you may show the original INR value in parentheses for transparency.
         
+        SPECIAL INSTRUCTIONS:
+        - For any query about the following high-level metrics, ALWAYS use the CEO dashboard section of the relevant month's MIS report as the primary source. Every month's MIS report contains a CEO dashboard with these metrics:
+            • Gross Renewal Rate (%)
+            • Net Renewal Rate (%)
+            • Monetization (%) - FY24 till date
+            • Net Rev per Employee ($)
+            • Customer Count (#)
+            • Avg. Rev per client ($)
+            • TTM Attrition (Vol.) Rate (%)
+            • S&M Multiple (x)
+            • S&M (% of Rev)
+            • G&A (% of Rev)
+            • GMPP (in Months)
+            • LTV:CAC
+            • 40% Rule Check - GAAP Basis
+        - If the user asks for these metrics for a specific month, use that month's CEO dashboard. For full-year, Q4, or overall company queries, use the CEO dashboard from the March 2025 MIS report.
+        
         GUARDRAILS:
         - Do not hallucinate on the user's question. Stay relevant to the user's question.
         - Stick to the data provided and do not make up any data.
@@ -1127,6 +1197,88 @@ ENHANCED QUERY:"""
                         raise
         logging.error(f"All Gemini key/model combinations failed. Tried: {tried}")
         raise RuntimeError(f"No valid Gemini client/model available for LLM call. Tried: {tried}")
+
+def get_ceo_dashboard_chunks(vector_store, month: str, k: int = 3):
+    """Retrieve up to k chunks from pages 8, 9, 10 of the relevant month's PDF."""
+    ceo_chunks = []
+    all_results = vector_store.similarity_search_with_score("ceo dashboard", k=100)  # Large k to get all
+    for doc, score in all_results:
+        source_file = doc.metadata.get('source_file', '').lower()
+        page = doc.metadata.get('page', -1)
+        if month in source_file and page in [7, 8, 9, 10]:
+            ceo_chunks.append((doc, score))
+            if len(ceo_chunks) >= k:
+                break
+    return ceo_chunks
+
+# Add a list of high-level CEO dashboard metrics
+CEO_DASHBOARD_METRICS = [
+    # Gross Renewal Rate
+    "gross renewal rate", "grr", "gross renewal", "gross renewal (%)", "gross renewal percent", "gross renewal percentage",
+    # Net Renewal Rate
+    "net renewal rate", "nrr", "net renewal", "net renewal (%)", "net renewal percent", "net renewal percentage",
+    # Monetization
+    "monetization", "monetization (%)", "monetization percent", "monetization percentage", "monetization rate",
+    # Net Revenue per Employee
+    "net rev per employee", "net revenue per employee", "revenue per employee", "rev/employee", "revenue/employee", "net rev/employee",
+    # Customer Count
+    "customer count", "number of customers", "customers count", "customer base", "total customers", "customer #", "customer no.", "customer number",
+    # Average Revenue per Client
+    "avg. rev per client", "average revenue per client", "average rev per client", "avg revenue per client", "avg rev/client", "average revenue/client", "arpc",
+    # TTM Attrition Rate
+    "ttm attrition", "ttm attrition rate", "trailing twelve month attrition", "trailing 12 month attrition", "attrition rate", "voluntary attrition rate", "ttm attrition (vol.) rate", "ttm attrition (%)",
+    # S&M Multiple
+    "s&m multiple", "sales & marketing multiple", "sales and marketing multiple", "s&m mult.", "s&m (x)", "s&m multiple (x)",
+    # S&M as % of Revenue
+    "s&m (% of rev)", "sales & marketing % of revenue", "sales and marketing % of revenue", "s&m percent of revenue", "s&m % of revenue", "s&m % rev",
+    # G&A as % of Revenue
+    "g&a (% of rev)", "general & admin % of revenue", "general and admin % of revenue", "g&a percent of revenue", "g&a % of revenue", "g&a % rev",
+    # GMPP (in Months)
+    "gmpp", "gmpp (in months)", "gmpp months", "gross margin payback period", "payback period (gmpp)",
+    # LTV:CAC
+    "ltv:cac", "ltv to cac", "ltv/cac", "lifetime value to customer acquisition cost", "lifetime value/customer acquisition cost",
+    # 40% Rule
+    "40% rule", "40% rule check", "rule of 40", "rule of forty", "40 percent rule", "40% rule - gaap basis", "rule of 40 - gaap"
+]
+
+def is_ceo_dashboard_metric_query(query: str) -> bool:
+    q = query.lower()
+    return any(metric in q for metric in CEO_DASHBOARD_METRICS)
+
+# Patch MarchPDFRetrieval.prioritized_retrieval to always include CEO dashboard chunks for relevant queries
+old_prioritized_retrieval = MarchPDFRetrieval.prioritized_retrieval
+
+def new_prioritized_retrieval(vector_store, query: str, k: int = 15):
+    months = extract_months_from_query(query)
+    results = []
+    ceo_chunks = []
+    # If query is for a CEO dashboard metric, always include CEO dashboard chunks
+    if months and is_ceo_dashboard_metric_query(query):
+        for month in months:
+            ceo_chunks += get_ceo_dashboard_chunks(vector_store, month, k=3)
+        ceo_content = {doc.page_content for doc, _ in ceo_chunks}
+        # Now do normal month prioritization, but skip duplicates
+        month_content = set(ceo_content)
+        for month in months:
+            month_chunks = MonthPDFRetrieval.retrieve_from_month_pdf(vector_store, query, month, k=8)
+            for doc, score in month_chunks:
+                if doc.page_content not in month_content:
+                    results.append((doc, score))
+                    month_content.add(doc.page_content)
+        # Supplement with 8 general chunks
+        general_results = vector_store.similarity_search_with_score(query, k=16)
+        for doc, score in general_results:
+            if doc.page_content not in month_content and len(results) < (len(months)*8 + 8):
+                results.append((doc, score))
+        # Prepend CEO dashboard chunks
+        results = ceo_chunks + results
+        logging.info(f"📈 Total chunks after CEO dashboard prioritization: {len(results)}")
+    else:
+        # Fallback to original logic
+        results = old_prioritized_retrieval(vector_store, query, k)
+    return results
+
+MarchPDFRetrieval.prioritized_retrieval = new_prioritized_retrieval
 
 # Alias for compatibility
 RAGSystem = EnhancedRAGSystem
